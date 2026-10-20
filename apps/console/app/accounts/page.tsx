@@ -8,6 +8,7 @@ import {
 } from "../lib/custody";
 import type { AccountVM, AccountKind } from "../lib/custody";
 import { QrKeyScanner } from "../components/QrKeyScanner";
+import { ExportPrivateKeysButton, MnemonicPanel } from "../components/AccountExport";
 import { useVault } from "../components/AppGate";
 
 const splitKeys = (s: string): string[] => s.split(/[\s,]+/).map((k) => k.trim()).filter(Boolean);
@@ -170,6 +171,8 @@ function AccountBlock({ account, onChange }: { account: AccountVM; onChange: (ac
   const [importing, setImporting] = useState(false);
   const [keys, setKeys] = useState("");
   const [confirmDrop, setConfirmDrop] = useState(false);
+  // 助记词面板：只在用户显式点击时读出明文，关闭即从内存丢弃
+  const [showMnemonic, setShowMnemonic] = useState(false);
 
   const run = async (fn: () => Promise<AccountVM[]>, after?: () => void) => {
     setBusy(true); setMsg(null);
@@ -214,6 +217,18 @@ function AccountBlock({ account, onChange }: { account: AccountVM; onChange: (ac
         {!renaming && (
           <div className="flex flex-wrap items-center gap-2">
             <Button size="sm" icon={DownloadSimpleIcon} disabled={busy || account.walletCount === 0} onClick={exportAddresses}>Export addresses</Button>
+            {account.kind === "HD" && (
+              <Button
+                size="sm"
+                icon={KeyIcon}
+                disabled={busy}
+                aria-pressed={showMnemonic}
+                onClick={() => setShowMnemonic((v) => !v)}
+              >
+                {showMnemonic ? "Hide mnemonic" : "Export mnemonic"}
+              </Button>
+            )}
+            <ExportPrivateKeysButton slug={account.slug} name={account.name} disabled={busy || account.walletCount === 0} />
             <Button size="sm" icon={PencilSimpleIcon} disabled={busy} onClick={() => setRenaming(true)}>Rename</Button>
             {confirmDrop ? (
               <>
@@ -228,6 +243,9 @@ function AccountBlock({ account, onChange }: { account: AccountVM; onChange: (ac
       </LayerCard.Secondary>
 
       <LayerCard.Primary className="flex flex-col gap-2">
+        {account.kind === "HD" && showMnemonic && (
+          <MnemonicPanel slug={account.slug} name={account.name} onClose={() => setShowMnemonic(false)} />
+        )}
         {account.kind === "HD" ? (
           <div className="flex items-center gap-2">
             <Input type="number" min={1} size="sm" aria-label="Number of wallets to add" className="w-20" value={deriveN} onChange={(e) => setDeriveN(Math.max(1, Number(e.target.value) || 1))} />

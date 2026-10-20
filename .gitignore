@@ -11,3 +11,5 @@ next-env.d.ts
 test-results/
 playwright-report/
 playwright/.cache/
+# 「官网登录」worker 失败时留下的排查截图
+.nado-login-shots/

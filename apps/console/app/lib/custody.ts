@@ -35,7 +35,11 @@ interface BrowserEvm { publicKey: string; vm: string; signTypedData(td: unknown,
 // is picked off the real wative Address so refuelGasLive builds a native send without a blind cast.
 export type InTabEvmAddress = BrowserEvm & { readonly vm: "evm"; readonly network: unknown } & Pick<WativeEvmAddress, "buildTransaction">;
 
-interface BrowserWallet { evm: BrowserEvm | null }
+interface BrowserWallet {
+  evm: BrowserEvm | null;
+  /** wative 的钱包私钥导出（仅在内存中返回明文，调用方负责不落盘）。 */
+  dumpPrivateKey(vm: string): string;
+}
 interface BrowserAccount {
   readonly slug: string; displayName: string; readonly organizationType?: string;
   wallets: BrowserWallet[];
@@ -44,6 +48,8 @@ interface BrowserAccount {
   importPrivateKey(key: string, vm?: string): Promise<unknown>;
   rename(displayName: string): Promise<unknown>;
   drop(): Promise<unknown>;
+  /** 导出 HD 账户的助记词（wative 加密保存在库中，解锁后可在内存中取明文）。 */
+  dumpMnemonic(): string;
 }
 interface BrowserAccountCollection {
   create(name: string, pw: string, secret: string): Promise<BrowserAccount>;
@@ -255,6 +261,39 @@ export function listAccounts(): AccountVM[] {
 /** The EVM addresses of one account's wallets (for export) — the flat cohort filtered by slug. */
 export function accountAddresses(slug: string): string[] {
   return cohortWallets().filter((w) => w.accountSlug === slug).map((w) => w.address);
+}
+
+/** 一个待登录钱包的最小凭据（仅存在于内存，禁止落盘/打日志）。 */
+export interface ExportedEvmKey { index: number; address: `0x${string}`; privateKey: `0x${string}` }
+
+/** 导出某个账户前 `limit` 个 EVM 钱包的私钥，供本地「官网登录」自动化进程在内存中签名。
+ *  私钥只在本标签页内产生，通过 127.0.0.1 传给本机 Playwright 进程，不写数据库。 */
+export function exportEvmPrivateKeys(slug: string, limit?: number): ExportedEvmKey[] {
+  const sa = session?.accounts.find((a) => a.slug === slug);
+  if (!sa) throw new Error(`no account ${slug}`);
+  const out: ExportedEvmKey[] = [];
+  let index = 0;
+  for (const w of sa.acc.wallets) {
+    if (!w.evm) continue; // 跳过纯 SVM 钱包（本功能只登录 EVM 钱包）
+    if (limit != null && out.length >= limit) break;
+    const pk = w.dumpPrivateKey("evm");
+    out.push({
+      index,
+      address: w.evm.publicKey as `0x${string}`,
+      privateKey: (pk.startsWith("0x") ? pk : `0x${pk}`) as `0x${string}`,
+    });
+    index++;
+  }
+  return out;
+}
+
+/** 导出 HD 账户的助记词，供导入 MetaMask / Rabby 等钱包软件。
+ *  wative 的派生路径是标准 BIP44 m/44'/60'/0'/0/i，导入后第 n 个地址即第 n 个钱包。 */
+export function exportMnemonic(slug: string): string {
+  const sa = session?.accounts.find((a) => a.slug === slug);
+  if (!sa) throw new Error(`no account ${slug}`);
+  if (sa.kind !== "HD") throw new Error("只有 HD 账户有助记词，PK 账户请导出私钥");
+  return sa.acc.dumpMnemonic();
 }
 
 // ---- legacy single-"fleet"-account cohort flows (home page / existing tests) --------

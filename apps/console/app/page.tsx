@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Badge, Button, Empty, LinkButton, Sidebar as KumoSidebar, Text, Tooltip } from "@cloudflare/kumo";
-import { ArrowRightIcon, FunnelIcon, ReceiptIcon, UsersThreeIcon, WalletIcon } from "@phosphor-icons/react";
+import { ArrowRightIcon, FunnelIcon, ReceiptIcon, SignInIcon, UsersThreeIcon, WalletIcon } from "@phosphor-icons/react";
 import { filterWallets, accountOptions, cohortsOf } from "@farm/ui";
 import type { WalletVM, Fleet } from "@farm/ui";
 import { Sidebar } from "./components/Sidebar";
@@ -244,6 +244,7 @@ export default function Page() {
               <ArrowRightIcon className="shrink-0" />
             </span>
             <LinkButton href="/accounts" variant="secondary" icon={UsersThreeIcon} className="shrink-0">Accounts</LinkButton>
+            <LinkButton href="/nado-login" variant="secondary" icon={SignInIcon} className="shrink-0">Nado Login</LinkButton>
             <Button icon={ReceiptIcon} className="shrink-0" onClick={() => setAccountingOpen(true)}>Accounting</Button>
           </div>
         </header>
