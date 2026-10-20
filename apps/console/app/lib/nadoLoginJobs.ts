@@ -9,6 +9,8 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { recordCheck, recordFailure, recordLogin } from "./nadoRegistry";
+import { registryUpdateFor } from "./nadoRegistryModel";
 
 export interface NadoLoginKey { index: number; address: string; privateKey: string }
 export type { WalletLoginStatus, WalletLoginResult, NadoLoginJobView } from "./nadoLoginTypes";
@@ -22,6 +24,8 @@ export type NadoLoginJob = {
   startedAt: number;
   results: WalletLoginResult[];
   log: string[];
+  mode: "login" | "check";
+  accountSlug?: string;
 };
 
 const jobs = new Map<string, NadoLoginJob>();
@@ -47,8 +51,15 @@ function pruneJobs(): void {
 }
 
 /** 启动一个登录任务；返回创建好的任务（私钥不会进入任务对象）。
- *  `keepOpenMs` > 0 表示「登录并查看」模式：确认成功后浏览器窗口保留一段时间。 */
-export function startNadoLoginJob(keys: NadoLoginKey[], keepOpenMs = 0): NadoLoginJob {
+ *  `keepOpenMs` > 0 表示「登录并查看」模式：确认成功后浏览器窗口保留一段时间。
+ *  `mode = "check"` 表示只检查注册状态：无头登录后观察引导弹窗，不做引导操作。
+ *  `accountSlug` 只用于把结果登记到注册表（便于按账户对齐）。 */
+export function startNadoLoginJob(
+  keys: NadoLoginKey[],
+  keepOpenMs = 0,
+  mode: "login" | "check" = "login",
+  accountSlug?: string,
+): NadoLoginJob {
   const job: NadoLoginJob = {
     id: randomUUID(),
     status: "running",
@@ -57,6 +68,8 @@ export function startNadoLoginJob(keys: NadoLoginKey[], keepOpenMs = 0): NadoLog
     startedAt: Date.now(),
     results: keys.map((k) => ({ index: k.index, address: k.address, status: "pending" })),
     log: [],
+    mode,
+    accountSlug,
   };
   jobs.set(job.id, job);
   pruneJobs();
@@ -68,7 +81,7 @@ export function startNadoLoginJob(keys: NadoLoginKey[], keepOpenMs = 0): NadoLog
   });
 
   // 私钥只在内存中通过 stdin 传给 worker，不写文件、不进日志
-  child.stdin.write(JSON.stringify({ wallets: keys, keepOpenMs }));
+  child.stdin.write(JSON.stringify({ wallets: keys, keepOpenMs, mode }));
   child.stdin.end();
 
   let buffered = "";
@@ -100,6 +113,7 @@ export function startNadoLoginJob(keys: NadoLoginKey[], keepOpenMs = 0): NadoLog
         if (r.status === "pending" || r.status === "running") {
           r.status = "failed";
           r.error = r.error ?? `worker 提前退出（code=${code ?? "unknown"}）`;
+          recordResult(job, r);
         }
       }
       job.status = "failed";
@@ -127,8 +141,12 @@ function handleWorkerLine(job: NadoLoginJob, line: string): void {
       result.error = typeof msg.error === "string" ? msg.error : undefined;
       result.ms = typeof msg.ms === "number" ? msg.ms : undefined;
       if (typeof msg.username === "string") result.username = msg.username;
+      if (typeof msg.registered === "boolean") result.registered = msg.registered;
       // 同一钱包只计一次完成，避免成功后又收到收尾错误导致 finished 超过总数
-      if (!wasFinished && (status === "ok" || status === "failed")) job.finished++;
+      if (!wasFinished && (status === "ok" || status === "failed")) {
+        job.finished++;
+        recordResult(job, result);
+      }
     }
     return;
   }
@@ -141,8 +159,19 @@ function handleWorkerLine(job: NadoLoginJob, line: string): void {
     pushLog(job, `worker fatal: ${String(msg.error ?? "unknown")}`);
     return;
   }
-  if (msg.type === "start") pushLog(job, `开始登录 ${String(msg.total)} 个钱包`);
+  if (msg.type === "start") pushLog(job, `${job.mode === "check" ? "开始检查" : "开始登录"} ${String(msg.total)} 个钱包`);
   if (msg.type === "log") pushLog(job, `钱包 #${String(msg.index)} ${String(msg.note ?? "")}`);
+}
+
+/** 把单个钱包的最终结果写入注册表（按地址一一对应）。
+ *  写盘失败只记日志，不影响任务本身的成功 / 失败判定。 */
+function recordResult(job: NadoLoginJob, result: WalletLoginResult): void {
+  const update = registryUpdateFor(job.mode, result, job.accountSlug);
+  if (!update) return;
+  const onError = (e: unknown) => pushLog(job, `注册表写入失败：${e instanceof Error ? e.message : String(e)}`);
+  if (update.kind === "check") void recordCheck(update).catch(onError);
+  else if (update.kind === "login") void recordLogin(update).catch(onError);
+  else void recordFailure(update).catch(onError);
 }
 
 function pushLog(job: NadoLoginJob, line: string): void {

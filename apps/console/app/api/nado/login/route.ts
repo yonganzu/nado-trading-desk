@@ -6,6 +6,7 @@
 // =============================================================================
 import { NextResponse } from "next/server";
 import { getNadoLoginJob, startNadoLoginJob } from "../../../lib/nadoLoginJobs";
+import { isLocalRequest } from "../../../lib/localRequest";
 import type { NadoLoginKey } from "../../../lib/nadoLoginJobs";
 
 export const runtime = "nodejs";
@@ -15,25 +16,21 @@ const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const PRIVATE_KEY_RE = /^0x[0-9a-fA-F]{64}$/;
 const MAX_WALLETS = 200;
 
-/** 仅允许本机请求：私钥只在本机浏览器与本地自动化进程之间传递。
- *  Next dev 可能补上 x-forwarded-for，因此只要 Host 与转发来源都是回环地址就放行。 */
-function isLocalRequest(req: Request): boolean {
-  const hostHeader = (req.headers.get("host") ?? "").toLowerCase();
-  const hostname = (hostHeader.split(":")[0] || new URL(req.url).hostname).replace(/^\[|\]$/g, "");
-  const forwarded = ((req.headers.get("x-forwarded-for") ?? "").split(",")[0] ?? "").trim().replace(/^\[|\]$/g, "");
-  const loopback = ["127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"];
-  return loopback.includes(hostname) && (!forwarded || loopback.includes(forwarded));
-}
-
 export async function POST(req: Request) {
   if (!isLocalRequest(req)) return NextResponse.json({ error: "only localhost may start login jobs" }, { status: 403 });
 
-  const body = (await req.json().catch(() => null)) as { wallets?: unknown; keepOpenMs?: unknown } | null;
+  const body = (await req.json().catch(() => null)) as {
+    wallets?: unknown; keepOpenMs?: unknown; mode?: unknown; accountSlug?: unknown;
+  } | null;
   const raw = Array.isArray(body?.wallets) ? body.wallets : [];
   if (raw.length === 0) return NextResponse.json({ error: "wallets is empty" }, { status: 400 });
   if (raw.length > MAX_WALLETS) return NextResponse.json({ error: `too many wallets (max ${MAX_WALLETS})` }, { status: 400 });
   // 「登录并查看」模式：把浏览器窗口保留一段时间（0 ~ 10 分钟）
   const keepOpenMs = Math.max(0, Math.min(600_000, Number(body?.keepOpenMs) || 0));
+  // "check" = 只检查注册状态（无头）；默认 = 完整登录 + 注册引导
+  const mode = body?.mode === "check" ? "check" : "login";
+  // 账户 slug 只用于登记表归类（不参与自动化）
+  const accountSlug = typeof body?.accountSlug === "string" && body.accountSlug.length <= 64 ? body.accountSlug : undefined;
 
   const keys: NadoLoginKey[] = [];
   for (let i = 0; i < raw.length; i++) {
@@ -45,7 +42,7 @@ export async function POST(req: Request) {
     keys.push({ index: typeof w?.index === "number" && Number.isInteger(w.index) ? w.index : i, address, privateKey });
   }
 
-  const job = startNadoLoginJob(keys, keepOpenMs);
+  const job = startNadoLoginJob(keys, keepOpenMs, mode, accountSlug);
   return NextResponse.json({ jobId: job.id, total: job.total });
 }
 

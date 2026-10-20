@@ -13,3 +13,6 @@ playwright-report/
 playwright/.cache/
 # 「官网登录」worker 失败时留下的排查截图
 .nado-login-shots/
+# 每个钱包的 Nado 注册结果登记表（本机数据，含地址与用户名）
+.nado-registry.json
+.nado-registry.json.*.tmp

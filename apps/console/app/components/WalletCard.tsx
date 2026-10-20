@@ -6,6 +6,8 @@ import { Badge, LayerCard, cn } from "@cloudflare/kumo";
 import type { BadgeVariant } from "@cloudflare/kumo";
 import type { WalletVM, WalletStatus } from "@farm/ui";
 import { AccountKindBadge } from "./AccountKindBadge";
+import type { WalletCheckState } from "../lib/walletCheck";
+import type { NadoOpenState } from "../lib/nadoOpen";
 
 const STATUS: Record<WalletStatus, [BadgeVariant, string]> = {
   active: ["success", "Active"],
@@ -22,7 +24,15 @@ const CARD_STYLE: CSSProperties = { contentVisibility: "auto", containIntrinsicS
 // the grid is column-virtualized, so the waste was every MOUNTED stable (mock) card re-rendering
 // on each live setLive tick (the sweep reconciles ~2/s). A card now re-renders only when its
 // wallet VM, selected, or onSelect changes.
-export const WalletCard = memo(function WalletCard({ wallet, selected, onSelect }: { wallet: WalletVM; selected: boolean; onSelect: (w: WalletVM) => void }) {
+export const WalletCard = memo(function WalletCard({ wallet, selected, onSelect, check, nado }: {
+  wallet: WalletVM;
+  selected: boolean;
+  onSelect: (w: WalletVM) => void;
+  /** 「检查 Nado 注册状态」的结果（未检查时为 undefined）。 */
+  check?: WalletCheckState;
+  /** 「一键打开 Nado 官网并登录」的状态（未点过时为 undefined）。 */
+  nado?: NadoOpenState;
+}) {
   const [statusVariant, statusLabel] = STATUS[wallet.status];
   // A Kumo LayerCard rendered AS the button (useRender + mergeProps keep the testid, handler and
   // content-visibility style). Kumo idioms: hover = bg-kumo-tint (instant), keyboard focus + selection
@@ -53,6 +63,14 @@ export const WalletCard = memo(function WalletCard({ wallet, selected, onSelect 
       </div>
       <div className="flex flex-wrap gap-1">
         {wallet.cohorts.map((c) => <Badge key={c} variant="secondary">{c}</Badge>)}
+        {check?.status === "registered" && <Badge variant="success">已注册</Badge>}
+        {check?.status === "unregistered" && <Badge variant="warning">未注册</Badge>}
+        {check?.status === "failed" && (
+          <span title={check.error}><Badge variant="error">检查失败</Badge></span>
+        )}
+        {nado?.status === "failed" && (
+          <span title={nado.error}><Badge variant="error">官网打开失败</Badge></span>
+        )}
       </div>
     </LayerCard>
   );

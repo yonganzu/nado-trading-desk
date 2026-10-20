@@ -70,7 +70,7 @@ export default function NadoLoginPage() {
       const res = await fetch("/api/nado/login", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ wallets: keys }),
+        body: JSON.stringify({ wallets: keys, accountSlug: account.slug }),
       });
       const body = (await res.json().catch(() => ({}))) as { jobId?: string; error?: string };
       if (!res.ok || !body.jobId) throw new Error(body.error ?? `启动失败 (${res.status})`);
@@ -97,7 +97,7 @@ export default function NadoLoginPage() {
       const res = await fetch("/api/nado/login", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ wallets: [key], keepOpenMs: 120_000 }),
+        body: JSON.stringify({ wallets: [key], keepOpenMs: 120_000, accountSlug: jobSlug }),
       });
       const body = (await res.json().catch(() => ({}))) as { jobId?: string; error?: string };
       if (!res.ok || !body.jobId) throw new Error(body.error ?? `启动失败 (${res.status})`);

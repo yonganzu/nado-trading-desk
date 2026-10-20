@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Badge, Button, Empty, LinkButton, Sidebar as KumoSidebar, Text, Tooltip } from "@cloudflare/kumo";
+import { Badge, Button, Empty, Input, LinkButton, Sidebar as KumoSidebar, Text, Tooltip } from "@cloudflare/kumo";
 import { ArrowRightIcon, FunnelIcon, ReceiptIcon, SignInIcon, UsersThreeIcon, WalletIcon } from "@phosphor-icons/react";
 import { filterWallets, accountOptions, cohortsOf } from "@farm/ui";
 import type { WalletVM, Fleet } from "@farm/ui";
@@ -15,6 +15,11 @@ import { bulk } from "./lib/bulk";
 import { fetchLiveState, reconcileWallet, mergeWallet, liveWalletVMs, isLiveWallet } from "./lib/live";
 import { readBudget, forceRefreshNative, TREASURY_WALLET_ID } from "./lib/liveContext";
 import { openOrderUpdateStream } from "./lib/orderUpdateStream";
+import { checkWalletRegistration, loadStoredChecks, readStoredCheck } from "./lib/walletCheck";
+import type { WalletCheckState } from "./lib/walletCheck";
+import { openWalletOnNado } from "./lib/nadoOpen";
+import type { NadoOpenState } from "./lib/nadoOpen";
+import { applyStoredStates } from "./lib/nadoRegistryModel";
 import type { LiveState } from "./lib/live";
 import { openLiveStream } from "./lib/liveStream";
 import type { LiveEvent } from "./lib/liveStream";
@@ -108,9 +113,49 @@ export default function Page() {
   const options = useMemo(() => accountOptions(fleet.accounts), [fleet]);
 
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(() => new Set());
-  const [selectedCohorts, setSelectedCohorts] = useState<Set<string>>(new Set());
+  const [selectedCohorts, setSelectedCohorts] = useState<Set<string>>(() => new Set());
+  // 地址搜索：只按开头或结尾匹配（大小写不敏感），输入 0x 前缀也能直接用
+  const [search, setSearch] = useState("");
   const [drawerWallet, setDrawerWallet] = useState<WalletVM | null>(null);
   const [accountingOpen, setAccountingOpen] = useState(false);
+  // 「检查 Nado 注册状态」的每钱包结果；真正的存储在服务端登记表，这里只是展示缓存
+  const [checks, setChecks] = useState<Record<string, WalletCheckState>>({});
+  const checkWallet = useCallback(async (w: WalletVM) => {
+    setChecks((s) => ({ ...s, [w.id]: { status: "running" } }));
+    const next = await checkWalletRegistration(w.accountId, w.address.value);
+    setChecks((s) => ({ ...s, [w.id]: next }));
+  }, []);
+  // 「一键打开 Nado 官网并登录」的每钱包状态（打开的是本机 Playwright 窗口，成功后保留一段时间）
+  const [nado, setNado] = useState<Record<string, NadoOpenState>>({});
+  const openNado = useCallback(async (w: WalletVM) => {
+    setNado((s) => ({ ...s, [w.id]: { status: "opening" } }));
+    const next = await openWalletOnNado(w.accountId, w.address.value);
+    setNado((s) => ({ ...s, [w.id]: next }));
+    if (next.status !== "open") return;
+    // 登录成功后 worker 会顺手写登记表，这里把结果同步到「已注册」徽标
+    const stored = await readStoredCheck(w.address.value);
+    if (stored) {
+      const state = { [w.address.value.toLowerCase()]: stored };
+      setChecks((s) => applyStoredStates(s, state, [{ id: w.id, address: w.address.value }]));
+    }
+  }, []);
+  // 页面加载 / 刷新 / 从 /nado-login 返回首页后，从后端登记表回填结果（按地址与钱包一一对应）。
+  // 依赖地址集合的字符串而不是数组引用：首页的实时刷新会不断生成新的 wallets 数组，
+  // 用数组引用做依赖会让这个请求被反复取消，导致后端已有的注册结果迟迟落不到卡片上。
+  const walletAddressKey = useMemo(
+    () => fleet.wallets.map((w) => w.address.value.toLowerCase()).sort().join(","),
+    [fleet.wallets],
+  );
+  useEffect(() => {
+    if (!walletAddressKey) return;
+    let cancelled = false;
+    const list = fleet.wallets.map((w) => ({ id: w.id, address: w.address.value }));
+    void loadStoredChecks().then((stored) => {
+      if (cancelled) return;
+      setChecks((cur) => applyStoredStates(cur, stored, list));
+    });
+    return () => { cancelled = true; };
+  }, [walletAddressKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Viewed-wallet priority: reconcile the OPENED live wallet immediately so the drawer shows
   // fresh state without waiting for the round-robin sweep to walk around to it.
@@ -172,10 +217,15 @@ export default function Page() {
     });
   }, [accountKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const shown = useMemo(
-    () => filterWallets(fleet.wallets, [...selectedAccounts], [...selectedCohorts]),
-    [fleet, selectedAccounts, selectedCohorts],
-  );
+  const shown = useMemo(() => {
+    const base = filterWallets(fleet.wallets, [...selectedAccounts], [...selectedCohorts]);
+    const q = search.trim().toLowerCase();
+    if (!q) return base;
+    return base.filter((w) => {
+      const addr = w.address.value.toLowerCase();
+      return addr.startsWith(q) || addr.endsWith(q);
+    });
+  }, [fleet, selectedAccounts, selectedCohorts, search]);
 
   const toggleCohort = (c: string) =>
     setSelectedCohorts((s) => { const n = new Set(s); if (n.has(c)) n.delete(c); else n.add(c); return n; });
@@ -239,6 +289,15 @@ export default function Page() {
             )}
           </div>
           <div className="flex min-w-0 items-center gap-3">
+            <Input
+              size="sm"
+              type="search"
+              placeholder="搜索地址开头 / 结尾"
+              aria-label="按地址开头或结尾搜索钱包"
+              className="w-52 shrink-0"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
             <span className="flex min-w-0 items-center gap-1 text-kumo-subtle">
               <span className="truncate">{shown.length} shown · scroll horizontally</span>
               <ArrowRightIcon className="shrink-0" />
@@ -264,7 +323,7 @@ export default function Page() {
               <Empty size="sm" icon={<FunnelIcon size={32} className="text-kumo-inactive" />} title="No wallets match the filter" />
             </div>
           ) : (
-            <WalletGrid wallets={shown} selectedId={drawerWallet?.id} onSelect={setDrawerWallet} />
+            <WalletGrid wallets={shown} selectedId={drawerWallet?.id} onSelect={setDrawerWallet} checks={checks} onCheck={checkWallet} nado={nado} onOpenNado={openNado} />
           )}
         </div>
       </main>

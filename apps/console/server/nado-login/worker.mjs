@@ -187,10 +187,11 @@ async function closeUsernameIntro(page) {
   return false;
 }
 
-/** 首次登录的条款弹窗：点击 Agree to Terms（未出现则视为已同意）。 */
-async function acceptTerms(page) {
+/** 首次登录的条款弹窗：点击 Agree to Terms（未出现则视为已同意）。
+ *  `timeoutMs` 控制等待弹窗出现的时长（检查模式下设短一些）。 */
+async function acceptTerms(page, timeoutMs = 12_000) {
   const btn = page.locator("[data-testid=terms-of-use-dialog-agree-to-terms-button]").first();
-  const appeared = await btn.waitFor({ state: "visible", timeout: 12_000 }).then(() => true).catch(() => false);
+  const appeared = await btn.waitFor({ state: "visible", timeout: timeoutMs }).then(() => true).catch(() => false);
   if (!appeared) return false;
   try {
     await btn.click({ timeout: 8_000 });
@@ -277,11 +278,22 @@ async function skipTutorial(page, maxSkips = 4) {
   return clicked;
 }
 
+/** 只读检查：条款弹窗是浏览器本地状态（新 context 必现），先同意它；
+ *  之后若仍弹出「We're Introducing Usernames」引导，说明该钱包还没完成注册。 */
+async function detectRegistration(page, onNote) {
+  const agreed = await acceptTerms(page, 6_000);
+  if (agreed) await onNote?.("检查时已接受条款弹窗（仅影响本次浏览器）");
+  const intro = page.locator("[data-testid=username-intro-dialog-next-button]").first();
+  const appeared = await intro.waitFor({ state: "visible", timeout: 10_000 }).then(() => true).catch(() => false);
+  return { registered: !appeared, reason: appeared ? "username-intro" : "no-onboarding-dialog" };
+}
+
 /** 单个钱包的完整登录流程。
+ *  `mode = "check"` 时只登录并判断注册状态，不做任何引导操作。
  *  `onVerified` 在确认登录成功后立即回调（用于先向页面汇报结果）；
  *  `onNote` 用于上报引导流程的告警（不影响登录成功状态）；
  *  `keepOpenMs` > 0 时把浏览器窗口保留一段时间，方便人工查看登录状态。 */
-async function loginWallet(browser, wallet, { keepOpenMs = 0, onVerified, onNote } = {}) {
+async function loginWallet(browser, wallet, { keepOpenMs = 0, mode = "login", onVerified, onNote } = {}) {
   const account = privateKeyToAccount(wallet.privateKey);
   if (account.address.toLowerCase() !== wallet.address.toLowerCase()) {
     throw new Error(`私钥与地址不匹配（期望 ${wallet.address}，实际 ${account.address}）`);
@@ -315,6 +327,14 @@ async function loginWallet(browser, wallet, { keepOpenMs = 0, onVerified, onNote
     if (!clicked) throw new Error("Privy 弹窗中找不到 MetaMask 选项");
     await waitForSignedIn(page, account.address);
 
+    // 检查模式：只判断注册状态（是否还有用户名引导），不设置用户名
+    if (mode === "check") {
+      const reg = await detectRegistration(page, onNote);
+      await onVerified?.({ registered: reg.registered });
+      await page.waitForTimeout(500).catch(() => {});
+      return;
+    }
+
     // 首次登录的引导流程：同意条款 -> 设置用户名 -> 跳过新手教程。
     // 任何一步失败只记一条告警，不推翻已经成功的登录。
     let username = null;
@@ -330,7 +350,7 @@ async function loginWallet(browser, wallet, { keepOpenMs = 0, onVerified, onNote
 
     // 先汇报成功，再把窗口留给人工查看。
     // 窗口被提前关闭（人工关窗/浏览器退出）不算登录失败，等待异常直接忽略。
-    await onVerified?.(username);
+    await onVerified?.({ username });
     if (keepOpenMs > 0) await page.waitForTimeout(keepOpenMs).catch(() => {});
   } catch (e) {
     // 失败时留一张截图便于排查（文件名只含序号，不含私钥）
@@ -348,11 +368,14 @@ async function main() {
   if (!wallets.length) throw new Error("wallets 为空");
   // 「登录并查看」模式：确认成功后让浏览器窗口停留（上限 10 分钟）
   const keepOpenMs = Math.max(0, Math.min(600_000, Number(payload?.keepOpenMs) || 0));
+  // "check" = 只登录并判断注册状态（无头运行，不弹窗口）；默认 "login" = 完整注册流程
+  const mode = payload?.mode === "check" ? "check" : "login";
+  const headless = mode === "check" ? true : HEADLESS;
 
   await mkdir(SHOT_DIR, { recursive: true });
   const browser = await chromium.launch({
     channel: "chrome",
-    headless: HEADLESS,
+    headless,
     args: ["--disable-blink-features=AutomationControlled"],
   });
 
@@ -366,11 +389,13 @@ async function main() {
         // 成功的第一时间汇报，随后（查看模式）把窗口留在登录页
         await loginWallet(browser, wallet, {
           keepOpenMs,
-          onVerified: (username) => {
+          mode,
+          onVerified: (info) => {
             verified = true;
             emitLine({
               type: "wallet", status: "ok", index: wallet.index, address: wallet.address,
-              ms: Date.now() - startedAt, username: username ?? undefined,
+              ms: Date.now() - startedAt, username: info?.username ?? undefined,
+              registered: typeof info?.registered === "boolean" ? info.registered : undefined,
             });
           },
           onNote: (note) => emitLine({ type: "log", index: wallet.index, note }),

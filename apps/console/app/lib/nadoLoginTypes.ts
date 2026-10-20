@@ -11,6 +11,8 @@ export interface WalletLoginResult {
   ms?: number;
   /** 首次登录时在官网上设置的用户名（老钱包为空）。 */
   username?: string;
+  /** 检查模式的结果：是否已完成注册（无首次登录引导弹窗）。 */
+  registered?: boolean;
 }
 
 export interface NadoLoginJobView {
