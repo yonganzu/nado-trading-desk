@@ -17,7 +17,8 @@ export interface WalletLoginResult {
 
 export interface NadoLoginJobView {
   id: string;
-  status: "running" | "done" | "failed";
+  /** cancelled = 用户手动停止（未处理的钱包标记为 failed，错误信息为「已手动停止」）。 */
+  status: "running" | "done" | "failed" | "cancelled";
   total: number;
   finished: number;
   startedAt: number;

@@ -21,9 +21,10 @@ import { join } from "node:path";
 const APP_URL = process.env.NADO_ONBOARD_URL || "https://app.nado.xyz/perpetuals?market=BTC";
 const CHAIN_ID_HEX = "0xdef1"; // Ink 57073
 const CHAIN_ID_DEC = String(parseInt(CHAIN_ID_HEX, 16));
-const HEADLESS = process.env.NADO_ONBOARD_HEADLESS === "1";
 const SHOT_DIR = join(process.cwd(), ".nado-login-shots");
 const WALLET_TIMEOUT_MS = Number(process.env.NADO_ONBOARD_WALLET_TIMEOUT_MS || 90_000);
+// 单个浏览器内允许的最大并发数（每个并发 = 一个独立 context + 一个官网标签页）
+const MAX_CONCURRENCY = Number(process.env.NADO_ONBOARD_MAX_CONCURRENCY || 8);
 
 /** 向页面注入的 EIP-1193 provider（声明为 MetaMask，签名回调到 Node 端）。 */
 function injectWallet(config) {
@@ -144,7 +145,13 @@ async function clickSignIn(page) {
   const btn = page.getByRole("button", { name: /^sign in$/i });
   const count = await btn.count().catch(() => 0);
   if (!count) throw new Error("页面上找不到 Sign In 按钮");
-  await btn.first().click();
+  try {
+    await btn.first().click({ timeout: 10_000 });
+  } catch {
+    // 可能被 cookie 横幅挡住：先关掉横幅再点一次
+    await dismissCookies(page);
+    await btn.first().click({ timeout: 10_000 });
+  }
 }
 
 /** 在主页与各 iframe 中寻找并点击 MetaMask 登录入口。 */
@@ -160,7 +167,7 @@ async function clickMetaMask(page, timeoutMs = 25_000) {
       const more = frame.getByText(/more options/i);
       if (await more.count().catch(() => 0)) await more.first().click().catch(() => {});
     }
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(400);
   }
   return false;
 }
@@ -191,7 +198,15 @@ async function closeUsernameIntro(page) {
  *  `timeoutMs` 控制等待弹窗出现的时长（检查模式下设短一些）。 */
 async function acceptTerms(page, timeoutMs = 12_000) {
   const btn = page.locator("[data-testid=terms-of-use-dialog-agree-to-terms-button]").first();
-  const appeared = await btn.waitFor({ state: "visible", timeout: timeoutMs }).then(() => true).catch(() => false);
+  const intro = page.locator("[data-testid=username-intro-dialog-next-button]").first();
+  // 轮询而不是死等：已注册的钱包不会弹条款（直接出现用户名引导，或什么都不弹），可以立刻返回
+  const deadline = Date.now() + timeoutMs;
+  let appeared = false;
+  while (Date.now() < deadline) {
+    if (await btn.isVisible().catch(() => false)) { appeared = true; break; }
+    if (await intro.isVisible().catch(() => false)) return false;
+    await page.waitForTimeout(200);
+  }
   if (!appeared) return false;
   try {
     await btn.click({ timeout: 8_000 });
@@ -200,7 +215,8 @@ async function acceptTerms(page, timeoutMs = 12_000) {
     await closeUsernameIntro(page);
     await btn.click({ timeout: 8_000 }).catch(() => {});
   }
-  await page.waitForTimeout(1_200);
+  // 只需等弹窗收起动画，后续引导弹窗由 setupUsername 自己等
+  await page.waitForTimeout(600);
   return true;
 }
 
@@ -213,9 +229,9 @@ function usernameFor(index) {
 async function fillUsername(page, input, save, name) {
   await input.fill("");
   await input.fill(name);
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 20; i++) {
     if (!(await save.isDisabled().catch(() => true))) return true;
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(250);
   }
   return false;
 }
@@ -224,7 +240,9 @@ async function fillUsername(page, input, save, name) {
  *  弹窗没出现（该钱包已设置过用户名）时返回 null。 */
 async function setupUsername(page, index, onNote) {
   const next = page.locator("[data-testid=username-intro-dialog-next-button]").first();
-  if (!(await next.isVisible().catch(() => false))) return null;
+  // 引导弹窗是异步出现的：最多等 2.5 秒；已注册的钱包不会出现，直接返回 null
+  const appeared = await next.waitFor({ state: "visible", timeout: 2_500 }).then(() => true).catch(() => false);
+  if (!appeared) return null;
   await next.click({ timeout: 10_000 });
 
   const dialog = page.locator("[data-testid=base-dialog-container]").first();
@@ -243,7 +261,7 @@ async function setupUsername(page, index, onNote) {
   await save.click({ timeout: 10_000 });
 
   await dialog.waitFor({ state: "hidden", timeout: 15_000 }).catch(() => {});
-  await page.waitForTimeout(1_000);
+  await page.waitForTimeout(500);
   return username;
 }
 
@@ -267,13 +285,13 @@ async function skipTutorial(page, maxSkips = 4) {
       break;
     }
     if (!hit) {
-      // 教程弹窗是异步出现的，短暂等待后再找；连续 3 次找不到就结束
-      if (++misses >= 3) break;
-      await page.waitForTimeout(1_500);
+      // 教程弹窗是异步出现的，短暂等待后再找；连续 2 次找不到就结束
+      if (++misses >= 2) break;
+      await page.waitForTimeout(800);
       continue;
     }
     misses = 0;
-    await page.waitForTimeout(1_400);
+    await page.waitForTimeout(900);
   }
   return clicked;
 }
@@ -293,13 +311,26 @@ async function detectRegistration(page, onNote) {
  *  `onVerified` 在确认登录成功后立即回调（用于先向页面汇报结果）；
  *  `onNote` 用于上报引导流程的告警（不影响登录成功状态）；
  *  `keepOpenMs` > 0 时把浏览器窗口保留一段时间，方便人工查看登录状态。 */
-async function loginWallet(browser, wallet, { keepOpenMs = 0, mode = "login", onVerified, onNote } = {}) {
+async function loginWallet(browser, wallet, { keepOpenMs = 0, mode = "login", headless = false, onVerified, onNote } = {}) {
   const account = privateKeyToAccount(wallet.privateKey);
   if (account.address.toLowerCase() !== wallet.address.toLowerCase()) {
     throw new Error(`私钥与地址不匹配（期望 ${wallet.address}，实际 ${account.address}）`);
   }
 
-  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: "en-US" });
+  const ctx = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+    locale: "en-US",
+    // 关掉动画偏好，减少等过渡动画的时间
+    reducedMotion: "reduce",
+  });
+  // 无窗口模式不需要图片 / 字体 / 视频：直接丢弃，页面更快、更省内存
+  if (headless) {
+    await ctx.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (type === "image" || type === "media" || type === "font") return route.abort().catch(() => {});
+      return route.continue().catch(() => {});
+    });
+  }
   const page = await ctx.newPage();
   try {
     // 签名能力只存在于 Node 端；页面拿不到私钥
@@ -318,11 +349,13 @@ async function loginWallet(browser, wallet, { keepOpenMs = 0, mode = "login", on
     await ctx.addInitScript(script);
 
     await page.goto(APP_URL, { waitUntil: "domcontentloaded", timeout: 90_000 });
-    await page.waitForTimeout(4_000);
+    // 页面把 Sign In 渲染出来就可以继续（替代固定 4 秒等待）
+    await page.getByRole("button", { name: /^sign in$/i }).first()
+      .waitFor({ state: "visible", timeout: 45_000 }).catch(() => {});
     await dismissCookies(page);
     await clickSignIn(page);
-    await page.waitForTimeout(2_500);
 
+    // Privy 弹窗由 clickMetaMask 自己轮询等待（替代固定 2.5 秒等待）
     const clicked = await clickMetaMask(page);
     if (!clicked) throw new Error("Privy 弹窗中找不到 MetaMask 选项");
     await waitForSignedIn(page, account.address);
@@ -370,7 +403,11 @@ async function main() {
   const keepOpenMs = Math.max(0, Math.min(600_000, Number(payload?.keepOpenMs) || 0));
   // "check" = 只登录并判断注册状态（无头运行，不弹窗口）；默认 "login" = 完整注册流程
   const mode = payload?.mode === "check" ? "check" : "login";
-  const headless = mode === "check" ? true : HEADLESS;
+  // 并发数：同一个浏览器里同时跑几个钱包（每个钱包一个独立 context），上限 8 避免把内存打满
+  const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Math.floor(Number(payload?.concurrency) || 1)));
+  // 检查模式固定无头；批量登录默认无头（更快、更省内存）；
+  // 「登录并查看」（keepOpenMs > 0）或显式要求时才打开窗口。
+  const headless = mode === "check" ? true : keepOpenMs > 0 ? false : payload?.headless !== false;
 
   await mkdir(SHOT_DIR, { recursive: true });
   const browser = await chromium.launch({
@@ -379,39 +416,53 @@ async function main() {
     args: ["--disable-blink-features=AutomationControlled"],
   });
 
-  emitLine({ type: "start", total: wallets.length });
+  emitLine({ type: "start", total: wallets.length, concurrency });
   try {
-    for (const wallet of wallets) {
-      const startedAt = Date.now();
-      let verified = false;
-      emitLine({ type: "wallet", status: "running", index: wallet.index, address: wallet.address });
-      try {
-        // 成功的第一时间汇报，随后（查看模式）把窗口留在登录页
-        await loginWallet(browser, wallet, {
-          keepOpenMs,
-          mode,
-          onVerified: (info) => {
-            verified = true;
-            emitLine({
-              type: "wallet", status: "ok", index: wallet.index, address: wallet.address,
-              ms: Date.now() - startedAt, username: info?.username ?? undefined,
-              registered: typeof info?.registered === "boolean" ? info.registered : undefined,
-            });
-          },
-          onNote: (note) => emitLine({ type: "log", index: wallet.index, note }),
-        });
-      } catch (e) {
-        // 已经确认成功后的收尾异常（例如人工关窗）不再覆盖成功状态
-        if (!verified) {
-          const error = e instanceof Error ? e.message : String(e);
-          emitLine({ type: "wallet", status: "failed", index: wallet.index, address: wallet.address, error, ms: Date.now() - startedAt });
-        }
+    // 简单任务池：每个协程从队列里取下一个钱包，取完即退出
+    let cursor = 0;
+    const runner = async () => {
+      while (cursor < wallets.length) {
+        const wallet = wallets[cursor++];
+        await runWallet(browser, wallet, { keepOpenMs, mode, headless });
       }
-    }
+    };
+    const lanes = Math.min(concurrency, wallets.length);
+    await Promise.all(Array.from({ length: lanes }, runner));
+    // 先汇报结束，浏览器关闭放到 finally 里慢慢收尾（Chrome 退出较慢，不该拖住页面轮询）
+    emitLine({ type: "done" });
   } finally {
     await browser.close().catch(() => {});
   }
-  emitLine({ type: "done" });
+}
+
+/** 登录（或检查）单个钱包，并把结果按钱包序号汇报给父进程。 */
+async function runWallet(browser, wallet, { keepOpenMs, mode, headless }) {
+  const startedAt = Date.now();
+  let verified = false;
+  emitLine({ type: "wallet", status: "running", index: wallet.index, address: wallet.address });
+  try {
+    // 成功的第一时间汇报，随后（查看模式）把窗口留在登录页
+    await loginWallet(browser, wallet, {
+      keepOpenMs,
+      mode,
+      headless,
+      onVerified: (info) => {
+        verified = true;
+        emitLine({
+          type: "wallet", status: "ok", index: wallet.index, address: wallet.address,
+          ms: Date.now() - startedAt, username: info?.username ?? undefined,
+          registered: typeof info?.registered === "boolean" ? info.registered : undefined,
+        });
+      },
+      onNote: (note) => emitLine({ type: "log", index: wallet.index, note }),
+    });
+  } catch (e) {
+    // 已经确认成功后的收尾异常（例如人工关窗）不再覆盖成功状态
+    if (!verified) {
+      const error = e instanceof Error ? e.message : String(e);
+      emitLine({ type: "wallet", status: "failed", index: wallet.index, address: wallet.address, error, ms: Date.now() - startedAt });
+    }
+  }
 }
 
 main().catch((e) => {

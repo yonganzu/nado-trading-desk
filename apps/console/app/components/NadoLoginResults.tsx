@@ -29,7 +29,13 @@ export function NadoLoginResults({ job, onInspect, inspectingIndex }: {
           {job.finished}/{job.total} 完成 · {ok} 成功 · {failed} 失败
         </Text>
         <Text variant="secondary" size="xs" as="span">
-          {job.status === "running" ? "任务进行中…" : job.status === "done" ? "全部成功" : "任务结束（存在失败）"}
+          {job.status === "running"
+            ? "任务进行中…"
+            : job.status === "done"
+              ? "全部成功"
+              : job.status === "cancelled"
+                ? "已手动停止"
+                : "任务结束（存在失败）"}
         </Text>
       </div>
       <ul className="flex flex-col divide-y divide-kumo-line rounded-md border border-kumo-line">

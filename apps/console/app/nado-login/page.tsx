@@ -1,12 +1,14 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Badge, Banner, Breadcrumbs, Button, ButtonGroup, Empty, Input, LayerCard, LinkButton, Text } from "@cloudflare/kumo";
-import { LockIcon, SignInIcon, UsersThreeIcon, WalletIcon, WarningCircleIcon } from "@phosphor-icons/react";
+import { Badge, Banner, Breadcrumbs, Button, ButtonGroup, Empty, Input, LayerCard, LinkButton, Switch, Text } from "@cloudflare/kumo";
+import { LockIcon, SignInIcon, StopIcon, UsersThreeIcon, WalletIcon, WarningCircleIcon } from "@phosphor-icons/react";
 import { exportEvmPrivateKeys, listAccounts } from "../lib/custody";
 import type { AccountVM } from "../lib/custody";
 import type { NadoLoginJobView, WalletLoginResult } from "../lib/nadoLoginTypes";
+import type { NadoRegistryEntry } from "../lib/nadoRegistryModel";
 import { NadoLoginResults } from "../components/NadoLoginResults";
+import { NadoRegistryHistory } from "../components/NadoRegistryHistory";
 import { useVault } from "../components/AppGate";
 
 /** app.nado.xyz 的「钱包登录 / 注册」页：从已解锁保险库取钱包，经本机 Playwright 打开官网，
@@ -16,13 +18,21 @@ export default function NadoLoginPage() {
   const [accounts, setAccounts] = useState<AccountVM[]>([]);
   const [slug, setSlug] = useState("");
   const [count, setCount] = useState(3);
+  // 并发数：同一个浏览器里同时登录几个钱包（越大越快，也越吃内存）
+  const [concurrency, setConcurrency] = useState(3);
+  // 是否显示浏览器窗口（默认无窗口，速度更快、内存更省）
+  const [showWindow, setShowWindow] = useState(false);
   const [busy, setBusy] = useState(false);
+  // 「停止注册」请求进行中（避免重复点击）
+  const [stopping, setStopping] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [job, setJob] = useState<NadoLoginJobView | null>(null);
   // 产生当前结果表所用的账户（「登录并查看」要按同一账户取私钥）
   const [jobSlug, setJobSlug] = useState<string | null>(null);
   // 「登录并查看」的独立任务状态（与批量任务分开，避免覆盖结果表）
   const [inspect, setInspect] = useState<{ index: number; status: "starting" | "running" | "ok" | "failed"; error?: string } | null>(null);
+  // 注册记录：后端登记表里当前账户的钱包结果（离开页面 / 刷新浏览器后仍然存在）
+  const [history, setHistory] = useState<NadoRegistryEntry[]>([]);
 
   useEffect(() => {
     const list = listAccounts();
@@ -34,6 +44,48 @@ export default function NadoLoginPage() {
   const account = useMemo(() => accounts.find((a) => a.slug === slug), [accounts, slug]);
   const maxCount = Math.max(1, account?.walletCount ?? 1);
   const effectiveCount = Math.min(Math.max(1, count), maxCount);
+
+  /** 读取后端登记表里属于某个账户的注册记录（按最近一次检查时间倒序）。
+   *  用账户的钱包地址来匹配，兼容首页「状态检查 / 一键打开」写入的记录。 */
+  const loadHistory = async (accountSlug: string) => {
+    if (!accountSlug) { setHistory([]); return; }
+    try {
+      const own = new Set(exportEvmPrivateKeys(accountSlug).map((k) => k.address.toLowerCase()));
+      const res = await fetch("/api/nado/registry", { cache: "no-store" });
+      if (!res.ok) return;
+      const body = (await res.json()) as { entries?: NadoRegistryEntry[] };
+      const list = (body.entries ?? []).filter((e) => own.has(e.address.toLowerCase()));
+      list.sort((a, b) => (b.checkedAt ?? b.lastAttemptAt ?? 0) - (a.checkedAt ?? a.lastAttemptAt ?? 0));
+      setHistory(list);
+    } catch { /* 网络抖动时保留上一次结果 */ }
+  };
+
+  useEffect(() => { void loadHistory(slug); }, [slug]);
+
+  // 任务结束后刷新记录：结果由 worker 异步写入登记表，稍等一下再读
+  useEffect(() => {
+    const status = job?.status;
+    if (!status || status === "running") return;
+    const timer = setTimeout(() => { void loadHistory(jobSlug ?? slug); }, 800);
+    return () => clearTimeout(timer);
+  }, [job?.status, jobSlug, slug]);
+
+  // 离开页面再回来：恢复最近一次任务（运行中的任务可以继续显示进度）
+  useEffect(() => {
+    if (!account || busy || job?.status === "running") return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch(`/api/nado/login?latest=1&accountSlug=${encodeURIComponent(account.slug)}`, { cache: "no-store" });
+        if (!res.ok) return;
+        const body = (await res.json()) as { job?: NadoLoginJobView | null };
+        if (cancelled || !body.job) return;
+        setJob(body.job);
+        setJobSlug(account.slug);
+      } catch { /* 忽略 */ }
+    })();
+    return () => { cancelled = true; };
+  }, [account, busy, job?.status]);
 
   // 轮询任务状态，直到任务结束
   const jobId = job?.id;
@@ -70,7 +122,12 @@ export default function NadoLoginPage() {
       const res = await fetch("/api/nado/login", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ wallets: keys, accountSlug: account.slug }),
+        body: JSON.stringify({
+          wallets: keys,
+          accountSlug: account.slug,
+          concurrency: Math.min(concurrency, keys.length),
+          headless: !showWindow,
+        }),
       });
       const body = (await res.json().catch(() => ({}))) as { jobId?: string; error?: string };
       if (!res.ok || !body.jobId) throw new Error(body.error ?? `启动失败 (${res.status})`);
@@ -82,6 +139,23 @@ export default function NadoLoginPage() {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  };
+
+  /** 手动停止当前注册任务：后端会结束 worker 与浏览器进程，未处理的钱包标记为「已手动停止」。 */
+  const stop = async () => {
+    if (!job || job.status !== "running" || stopping) return;
+    setStopping(true);
+    setErr(null);
+    try {
+      const res = await fetch(`/api/nado/login?jobId=${job.id}`, { method: "DELETE" });
+      const body = (await res.json().catch(() => ({}))) as { job?: NadoLoginJobView; error?: string };
+      if (!res.ok) throw new Error(body.error ?? `停止失败 (${res.status})`);
+      if (body.job) setJob(body.job);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -188,6 +262,21 @@ export default function NadoLoginPage() {
                     value={effectiveCount}
                     onChange={(e) => setCount(Math.min(maxCount, Math.max(1, Number(e.target.value) || 1)))}
                   />
+                  <Input
+                    type="number"
+                    min={1}
+                    max={8}
+                    label="并发数"
+                    description="同时登录的钱包数，越大越快、越吃内存"
+                    className="w-52"
+                    value={concurrency}
+                    onChange={(e) => setConcurrency(Math.min(8, Math.max(1, Number(e.target.value) || 1)))}
+                  />
+                  <Switch
+                    label="显示浏览器窗口"
+                    checked={showWindow}
+                    onCheckedChange={setShowWindow}
+                  />
                   <Button
                     variant="primary"
                     icon={SignInIcon}
@@ -197,6 +286,17 @@ export default function NadoLoginPage() {
                   >
                     {job?.status === "running" ? "登录中…" : "开始登录"}
                   </Button>
+                  {job?.status === "running" && (
+                    <Button
+                      variant="secondary"
+                      icon={StopIcon}
+                      loading={stopping}
+                      data-testid="nado-login-stop"
+                      onClick={stop}
+                    >
+                      停止注册
+                    </Button>
+                  )}
                   <Badge variant="secondary">{effectiveCount} / {maxCount}</Badge>
                 </div>
 
@@ -206,8 +306,9 @@ export default function NadoLoginPage() {
 
                 <Text variant="secondary" size="xs">
                   私钥仅在当前标签页内存中导出，经 127.0.0.1 交给本机 Playwright 进程签名，不写数据库、不写日志。
-                  自动化会打开一个真实 Chrome 窗口，逐个钱包点击官网 Sign In，并完成首次登录的引导：同意条款、
-                  按序号设置用户名（nado001…）、跳过新手教程的 4 步 Skip。
+                  自动化默认在后台无窗口运行，按「并发数」同时登录多个钱包（每个钱包一个独立标签页），
+                  并完成首次登录的引导：同意条款、按序号设置用户名（nado001…）、跳过新手教程的 4 步 Skip。
+                  需要观察过程时可以打开「显示浏览器窗口」。
                   注意：官网 ToU 禁止为奖励/空投刷量的行为，请自行评估合规风险。
                 </Text>
               </LayerCard.Primary>
@@ -247,6 +348,15 @@ export default function NadoLoginPage() {
                     }
                   />
                 )}
+              </LayerCard.Primary>
+            </LayerCard>
+          )}
+
+          {account && (
+            <LayerCard>
+              <LayerCard.Secondary>注册记录</LayerCard.Secondary>
+              <LayerCard.Primary>
+                <NadoRegistryHistory entries={history} />
               </LayerCard.Primary>
             </LayerCard>
           )}
