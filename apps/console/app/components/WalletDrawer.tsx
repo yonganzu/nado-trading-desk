@@ -130,7 +130,10 @@ export function WalletDrawer({ wallet, onClose, isLive = false, liveEvents, live
     const walletId = wallet.id;
     const load = () => readOrderBookLive(walletId, market, BOOK_DEPTH).then((b) => { if (!cancelled && b) setBook(b); }).catch(() => {});
     const t = setTimeout(load, 120);
-    const iv = setInterval(() => { if (readBudget() > 1) void load(); }, 5_000);
+    // 刷新间隔 5s → 15s：盘口是纯展示（6 档梯度），但每次刷新要 1 个 per-IP 读令牌，
+    // 和自成交引擎抢同一个 2 次/秒的预算。放慢到 15s 并提高余量门槛（>3），
+    // 抽屉开着跑自动化时就基本不会再把 429 传染给下单链路。
+    const iv = setInterval(() => { if (readBudget() > 3) void load(); }, 15_000);
     return () => { cancelled = true; clearTimeout(t); clearInterval(iv); };
   }, [isLive, open, market, wallet?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 

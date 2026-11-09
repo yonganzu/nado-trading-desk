@@ -19,7 +19,8 @@ import { Workspace } from "wative-core";
 import type { Market, MarketId, ChainId, Decimal, Bps } from "@farm/adapter-api";
 import { nadoMarketSizing } from "@farm/adapter-nado";
 import { EngineClient, ENGINE_WS_SUBSCRIPTION_CLIENT_ENDPOINTS } from "@nadohq/engine-client";
-import { NADO_DEPLOYMENTS, CHAIN_ID_TO_CHAIN_ENV, ENGINE_CLIENT_ENDPOINTS } from "@nadohq/client";
+import { NADO_DEPLOYMENTS, CHAIN_ID_TO_CHAIN_ENV } from "@nadohq/client";
+import { engineBaseUrl, directGatewayEnabled, DIRECT_GATEWAY_WS } from "../../lib/nadoEndpoints";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -75,7 +76,9 @@ async function buildPublicConfig(chainId: number): Promise<PublicConfig> {
   const env = CHAIN_ID_TO_CHAIN_ENV[chainId];
   if (!env) throw new Error(`no Nado chain-env for chainId ${chainId}`);
   const deploy = NADO_DEPLOYMENTS[env];
-  const engineUrl = ENGINE_CLIENT_ENDPOINTS[env];
+  // 主网走 direct 网关（东京同机房），测试网/回退走官方域名；WS 同理。
+  const engineUrl = engineBaseUrl(chainId);
+  const wsSubscribeUrl = directGatewayEnabled(env) ? DIRECT_GATEWAY_WS : ENGINE_WS_SUBSCRIPTION_CLIENT_ENDPOINTS[env];
   const engine = new EngineClient({ url: engineUrl }); // keyless: query-only
 
   const symResp = (await engine.getSymbols({})) as unknown as { symbols: Record<string, {
@@ -126,7 +129,7 @@ async function buildPublicConfig(chainId: number): Promise<PublicConfig> {
 
   return {
     chainId, endpoint: deploy.endpoint, engineUrl,
-    wsSubscribeUrl: ENGINE_WS_SUBSCRIPTION_CLIENT_ENDPOINTS[env],
+    wsSubscribeUrl,
     markets, productIds, byMarketId, byProductId, defaultProduct, products: [...byMarketId.values()],
   };
 }

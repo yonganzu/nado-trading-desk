@@ -12,10 +12,18 @@
 // requirement, and gas is stale-while-revalidate (a strict-ready gate would flakily skip tradeable
 // wallets). A pair whose placement throws is retried a few times, then skipped.
 import type { WalletVM } from "@farm/ui";
-import { placeOrderLive, closePositionLive, closeAllPositionsLive, cancelLive, marketTouchLive, readWalletBalances, beginPriorityReads, endPriorityReads, takeWriteTiming, type WriteTiming } from "./liveContext";
+import { placeOrderLive, closePositionLive, closeAllPositionsLive, cancelLive, marketTouchLive, readWalletBalances, readPositionSizeLive, beginPriorityReads, endPriorityReads, takeWriteTiming, type WriteTiming } from "./liveContext";
 import { activeNetwork } from "./chainEnv";
 import { shuffle } from "./rand";
 import { MIN_SPREAD_TICKS } from "./tradingRules";
+import { ensureClockOffset } from "./nadoClock";
+import { rebalanceRoles } from "./roleBalance";
+import { getLiveConfig, productFor } from "./liveConfig";
+import { startBboCache, stopBboCache, getBboQuote } from "./bboCache";
+import { notePairInventory, inventorySummary, resetInventoryWatch,
+  inventoryOverThreshold, clearInventory, setInventorySimulation, setInventoryThreshold, INVENTORY_THRESHOLD_USDT0,
+} from "./inventoryWatch";
+import { accountingLedger } from "./accountingLedger";
 
 /** Logged when the engine refuses an off-testnet run that wasn't confirmed — the UI's typed-RUN gate is
  *  the real guard; this backstop catches a non-UI caller. One string so UI + engine never drift. */
@@ -71,6 +79,8 @@ export interface RoundHooks {
   onPairStart?: (pair: readonly [WalletVM, WalletVM]) => void;
   /** Fires when a pair finishes — the filmstrip drains it; a "traded" one also feeds the metrics (+ ms). */
   onPairEnd?: (pair: readonly [WalletVM, WalletVM], outcome: "traded" | "skipped" | "error", ms: number) => void;
+  /** 余额失衡自动换了 maker/taker 角色后触发：页面的钱包列表据此重新拉取，标签立刻更新（不必等整轮跑完）。 */
+  onRolesChanged?: () => void;
 }
 
 export interface RoundResult {
@@ -108,6 +118,10 @@ const decimals = (tickStr: string): number => {
  *  tight spread or sequencer blip, but stops when the market can't host a self-cross or every wallet is
  *  capped. */
 const NO_TRADE_LIMIT = 3;
+
+/** 点差不足属于「市场暂时打不了自成交」，不是引擎卡住：给它更长的等待窗口，
+ *  否则盘口一收窄就 3 轮退场（实测 META bid 626.98 / ask 627.00 就是这样停的）。 */
+const THIN_SPREAD_LIMIT = 60;
 
 /** Extra attempts for a pair whose placement throws (a transient relay blip) before it's skipped. */
 const PAIR_RETRIES = 2;
@@ -148,8 +162,22 @@ async function eligible(wallets: readonly WalletVM[], role: string, hooks: Round
   for (const w of wallets) {
     if (w.readiness !== "unfunded") { ok.push(w); continue; }
     try {
-      const reads = await readWalletBalances(w.id);
-      const quote = reads.balances?.find((b) => b.scope === "margin");
+      // 读失败（429 / 网络抖动）必须和「真的没保证金」分开：readWalletBalances 内部把异常吞成
+      // undefined，直接按 0 处理会让一次限速就把有钱的钱包误判成「无抵押」，进而整轮/整 run 停下
+      // （实测 16:45:54 就是这样停的）。所以先退避重读 3 次。
+      let balances: Awaited<ReturnType<typeof readWalletBalances>>["balances"];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        balances = (await readWalletBalances(w.id)).balances;
+        if (balances) break;
+        if (attempt < 2) await sleepMs(500 * (attempt + 1)); // 0.5s → 1s
+      }
+      if (!balances) {
+        // 三次都读不到 = 状态未知（不是「没钱」）：放行，让下单时的引擎校验兜底（2006 会安全拒绝）
+        hooks.log(`⚠ ${short(w)} (${role}) 余额读不到（限速/网络），按「未知」放行。`);
+        ok.push(w);
+        continue;
+      }
+      const quote = balances.find((b) => b.scope === "margin");
       const margin = Number(quote?.total ?? 0);
       if (margin > 0) { ok.push(w); continue; }
       hooks.log(`⊘ ${short(w)} (${role}) not eligible — no collateral（现场读数 margin ${margin}）。`);
@@ -181,14 +209,37 @@ export function interiorTickPrice(bid: number, ask: number, tick: number, tickSt
   return (pTicks * tick).toFixed(decimals(tickStr));
 }
 
+/** 从 WS 的 all_bbo 快照里取盘口（零 REST 配额、毫秒级）。取不到 / 过期 / 单边 → undefined，
+ *  调用方回退到 REST 读盘口。all_bbo 的价格是 x18 定点的，这里除回人类小数。 */
+async function cachedTouch(market: string): Promise<{ bid: number; ask: number; tick: number; tickStr: string } | undefined> {
+  try {
+    const cfg = await getLiveConfig(); // 本地已缓存，不发请求
+    const p = productFor(cfg, market);
+    if (!p) return undefined;
+    const q = getBboQuote(p.productId);
+    if (!q) return undefined;
+    const bid = Number(q.bid) / 1e18;
+    const ask = Number(q.ask) / 1e18;
+    const tick = Number(p.tickSize);
+    if (!Number.isFinite(bid) || !Number.isFinite(ask) || !(tick > 0)) return undefined;
+    if (!(bid > 0) || !(ask > 0) || ask < bid) return undefined;
+    return { bid, ask, tick, tickStr: p.tickSize };
+  } catch {
+    return undefined;
+  }
+}
+
 /** 取自成交价；拿不到时返回跳过原因（空盘口 / 点差太窄），方便在日志里判断是不是选错了品种。 */
 async function selfCrossPrice(walletId: string, market: string, makerSide: "buy" | "sell"): Promise<
   { price: string; priceNum: number } | { skip: string }
 > {
-  const touch = await marketTouchLive(walletId, market);
+  // 优先吃 WS 快照：这一步原来要占一次 REST 读配额（per-IP 只有 ~2 次/秒），
+  // 排队严重时「round 开始 → maker 提交」能到 7s。缓存过期或没有行情时再走 REST。
+  const cached = await cachedTouch(market);
+  const touch = cached ?? await marketTouchLive(walletId, market);
   if (!touch) throw new Error(`品种 ${market} 在当前网络没有对应的产品（选错品种或网络不匹配）`);
-  // 读失败（限速 / 网络抖动）不能当成「空盘口」，两者原因和处置完全不同
-  if (touch.failed) return { skip: "读盘口失败（限速 429 或网络抖动），本轮跳过" };
+  // 读失败（限速 / 网络抖动）不能当成「空盘口」，两者原因和处置完全不同（WS 快照不会有 failed）
+  if ("failed" in touch && touch.failed) return { skip: "读盘口失败（限速 429 或网络抖动），本轮跳过" };
   const price = interiorTickPrice(touch.bid, touch.ask, touch.tick, touch.tickStr, makerSide);
   if (price !== null) return { price, priceNum: Number(price) };
   if (!(touch.bid > 0) || !(touch.ask > 0)) return { skip: `盘口为空或单边（bid ${touch.bid} / ask ${touch.ask}）` };
@@ -216,29 +267,125 @@ function sleepMs(ms: number): Promise<void> {
  *  否则残留仓位会一路累积，最终把保证金健康度压到 2006「Insufficient account health」。 */
 const dirtyWallets = new Set<string>();
 
-/** 平仓一次：区分「已确认平掉」「读不到持仓（429 等，无法确认）」「下单被拒」三种情况。 */
-async function flattenOnce(walletId: string, market: string): Promise<"flat" | "retry"> {
+/** 平仓一次：区分「已确认平掉」「读不到持仓（429 等，无法确认）」「下单被拒」三种情况。
+ *  失败时把真实原因带出去 —— 以前这里 catch 掉了错误，日志只剩「未确认」，没法判断是限速、
+ *  没流动性还是保证金不足（2006），排障只能靠猜。 */
+async function flattenOnce(walletId: string, market: string): Promise<{ ok: boolean; error?: string }> {
   try {
-    await closePositionLive(walletId, market);
-    return "flat"; // closed=0（本来就平）或已发出平仓单
-  } catch {
-    return "retry";
+    const r = await closePositionLive(walletId, market);
+    if (!r.closed) return { ok: true }; // 本来就没仓
+    // 下单成功 ≠ 已平掉：薄盘上的 reduceOnly IOC 可能一笔都没成交（或只成交一部分）。
+    // 等撮合结果落到「持仓」，再读一次真实仓位确认，残留就继续重试 —— 以前缺这一步，
+    // 会出现「日志说在平仓、实际仓位一点没动」的情况。
+    await sleepMs(400);
+    const left = await readPositionSizeLive(walletId, market);
+    if (Math.abs(left) > 1e-9) return { ok: false, error: `平仓单已发但仍有 ${left} 未平` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
 /** 平仓 + 确认重试：429 / 读持仓失败按 1s→2s→4s 退避重读，最多 4 次；
  *  仍失败则标记为「未确认平仓」，交给下一对的 dirtyWallets 再清扫。返回是否确认平掉。 */
 async function flattenWithRetry(walletId: string, market: string, hooks: RoundHooks, label: string): Promise<boolean> {
+  let lastError = "";
   for (let attempt = 0; attempt < 4; attempt++) {
-    if (await flattenOnce(walletId, market) === "flat") {
+    const r = await flattenOnce(walletId, market);
+    if (r.ok) {
       dirtyWallets.delete(walletId);
       return true;
     }
+    if (r.error) lastError = r.error;
     await sleepMs(1000 * (attempt + 1));
   }
   dirtyWallets.add(walletId);
-  hooks.log(`✗ flatten ${label} 未确认（已重试 4 次，可能残留敞口，下一对开始前会再平一次）`);
+  hooks.log(`✗ flatten ${label} 未确认（已重试 4 次${lastError ? `，最后一次原因：${lastError.slice(0, 140)}` : ""}；下一对开始前会再平一次）`);
   return false;
+}
+
+/** 净额对冲模式下的「按需平仓」：只有该钱包在这个市场的净仓顶到阈值才真平，平完把虚拟净仓归零。
+ *  没顶到就原地保留 —— 这一对的两条腿方向相反、数量相同，仓位在同一市场的不同钱包之间互相抵消。 */
+async function flattenIfOverThreshold(w: WalletVM, market: string, hooks: RoundHooks, label: string): Promise<void> {
+  if (!inventoryOverThreshold(w.id, market)) return;
+  if (await flattenWithRetry(w.id, market, hooks, label)) clearInventory(w.id, market);
+}
+
+/** 平仓也走自成交（新模式）：上一轮的**吃单方**挂一张 reduce-only + post-only，上一轮的**挂单方**
+ *  用 reduce-only IOC 去吃它 —— 两条平仓腿在同一价格上互相对敲，不再各自去撞外部盘口。
+ *
+ *  角色对应（开仓时 maker 方向 = makerSide）：
+ *    makerSide=buy  → maker 持多、taker 持空 → 平仓：taker 挂 buy、maker 吃 sell
+ *    makerSide=sell → maker 持空、taker 持多 → 平仓：taker 挂 sell、maker 吃 buy
+ *  即「挂单方 = 上一轮的吃单方，方向与上一轮 maker 相同」，两个钱包每对各当一次 maker / taker。
+ *
+ *  失败（仓位不足、点差不够、挂单被第三方吃掉、IOC 没吃到）统一返回 ok=false，由调用方回退市价平仓。 */
+async function closePairSelfCross(
+  maker: WalletVM, taker: WalletVM, market: string, hooks: RoundHooks,
+  makerSide: "buy" | "sell", takerSide: "buy" | "sell", size: string | number,
+): Promise<{ ok: boolean; price?: string; ms: number; error?: string }> {
+  const t0 = Date.now();
+  const ms = () => Date.now() - t0;
+  let restingVenueId: string | undefined;
+  try {
+    // 不再读两边的真实持仓（每对省 2 个 REST 令牌，429 概率明显下降）：
+    // 自成交的开仓两腿是「同一价位上的唯一对手方」，一边成交多少另一边就是多少，
+    // 所以两边仓位天然等量 —— 平仓数量直接用这一对的数量。
+    // 万一某条腿没成交 / 只部分成交，reduce-only 超量会被拒或被引擎截断，绝不会反向开仓，
+    // 最后仍由调用方回退市价平仓兜底（那条路径会重新读真实持仓）。
+    const qty = Number(size);
+    if (!(qty > 0)) return { ok: false, ms: ms(), error: `数量无效（${size}）` };
+    // 平仓价同样取「离挂单方这一侧最近」的内沿 tick，给吃单腿留最大的量
+    const px = await selfCrossPrice(taker.id, market, makerSide);
+    if ("skip" in px) return { ok: false, ms: ms(), error: px.skip };
+
+    // 平仓一对要发 4 笔写（开仓 2 + 平仓 2），很容易撞上 per-IP 写配额。
+    // 命中 429 时先退避重试一次再认输 —— 直接回退市价平仓等于把省下的点差又吐回去。
+    const tryPlace = async (
+      fn: () => Promise<Awaited<ReturnType<typeof placeOrderLive>>>,
+    ): Promise<Awaited<ReturnType<typeof placeOrderLive>>> => {
+      try {
+        return await fn();
+      } catch (e) {
+        if (!isRateLimited(e)) throw e;
+        hooks.log(`⏳ 平仓自成交撞到限速，退避 ${RATE_LIMIT_BACKOFF_MS / 1000}s 后重试`);
+        await sleepMs(RATE_LIMIT_BACKOFF_MS);
+        return await fn();
+      }
+    };
+
+    // ① 上一轮的吃单方挂 reduce-only + post-only（既不主动吃别人，也不会反向开仓）
+    const rest = await tryPlace(() => placeOrderLive(taker.id, market, {
+      side: makerSide, size: qty, price: px.price,
+      postOnly: true, reduceOnly: true, jobId: `close-${Date.now()}-r`, signal: hooks.signal,
+    }));
+    restingVenueId = rest.venueId;
+    try {
+      // ② 上一轮的挂单方 IOC 去吃它
+      await tryPlace(() => placeOrderLive(maker.id, market, {
+        side: takerSide, size: qty, price: px.price,
+        taker: true, reduceOnly: true, jobId: `close-${Date.now()}-t`, signal: hooks.signal,
+      }));
+    } catch (e) {
+      // 吃单腿失败：挂单还留在盘口上，先撤掉再抛出去，避免残留挂单被第三方吃掉
+      await cancelLive(taker.id, market, restingVenueId).catch(() => {});
+      throw e;
+    }
+    restingVenueId = undefined;
+    // 撮合结果落到持仓有延迟，等一下再复核两边是否都归零
+    await sleepMs(400);
+    const [m2, t2] = await Promise.all([
+      readPositionSizeLive(maker.id, market),
+      readPositionSizeLive(taker.id, market),
+    ]);
+    if (Math.abs(m2) > 1e-9 || Math.abs(t2) > 1e-9) {
+      return { ok: false, price: px.price, ms: ms(), error: `仍有残留（maker ${m2} / taker ${t2}）` };
+    }
+    return { ok: true, price: px.price, ms: ms() };
+  } catch (e) {
+    if (restingVenueId) await cancelLive(taker.id, market, restingVenueId).catch(() => {});
+    return { ok: false, ms: ms(), error: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /** 一键清扫一组钱包的**全部**未平仓位：逐个读一次持仓，把每个非零仓位用 reduce-only 穿价 IOC
@@ -269,6 +416,15 @@ async function flattenAll(wallets: readonly WalletVM[], hooks: RoundHooks, phase
   else hooks.log(`✓ ${label}清扫完成 — ${seen.size} 个钱包已检查，发出 ${closed} 笔市价平仓单。`);
   return failed;
 }
+
+/** 收尾方式（三个同级模式）：
+ *  - pair      逐对平仓：每对结束，两个钱包各自市价平掉（外部成交，跨点差）
+ *  - selfCross 平仓自成交：两条平仓腿也互相对敲（同价成交，不跨点差，自成交量翻倍）
+ *  - hedge     净额对冲：不平，仓位留在钱包里互相抵消，单钱包净仓顶到阈值才平 */
+export type FlattenMode = "pair" | "selfCross" | "hedge";
+
+// 由 runContinuous 的 opts.mode 决定（opts.hedge 仍兼容）
+let MODE: FlattenMode = "pair";
 
 /** Trade one pair, or skip it when the spread can't host a clean self-cross. On ANY outcome the finally
  *  clears a resting maker remainder and flattens both wallets, so a mid-pair failure never leaks a live
@@ -328,6 +484,12 @@ async function runPair([maker, taker]: [WalletVM, WalletVM], i: number, cfg: Rou
       takerMs = legsMs;
       takerT = takeWriteTiming();
       bumpCaps(state, maker.id, taker.id, notional); // count it only once both legs are in
+      // 库存观察（只统计）：按成交累加虚拟净仓，模拟「不平仓会积累多少、阈值策略下能省多少」。
+      // 真实流程仍在 finally 里平仓，这里不改变任何下单行为。
+      notePairInventory({
+        makerId: maker.id, takerId: taker.id, market: cfg.market,
+        symbol: symbolOfMarket(cfg.market), makerSide, size, price: Number(px.priceNum),
+      });
       // 两腿间隔拆成 maker 提交 / taker 提交，再拆成「本地 / 等令牌 / relay」：
       // relay 占比高 = 网络或 sequencer 慢；本地占比高 = 签名/组装慢；带「重试 n 次」= 被 429 拖的。
       hooks.log(`✓ pair ${i + 1}: ${short(maker)} ${makerSide} ↔ ${short(taker)} ${takerSide} · ${notional.toFixed(0)} USDT0 @ ${px.price}（${spent()}，两腿间隔 ${(legsMs / 1000).toFixed(1)}s：maker 提交 ${legStr(makerMs, makerT)}，taker 提交 ${legStr(takerMs, takerT)}）`);
@@ -342,8 +504,39 @@ async function runPair([maker, taker]: [WalletVM, WalletVM], i: number, cfg: Rou
       // 撮合结果落到「持仓」有一小段延迟：立刻读可能还是 0，于是不平仓、把敞口漏到下一轮。
       // 等一小会儿再读，代价 0.25s，换来的是「每对结束必然平掉」。
       await sleepMs(250);
-      await flattenWithRetry(maker.id, cfg.market, hooks, short(maker));
-      await flattenWithRetry(taker.id, cfg.market, hooks, short(taker));
+      if (MODE === "hedge") {
+        // 净额对冲：仓位保留在钱包里（同一市场的两侧彼此抵消），只有单钱包净仓顶到阈值才平掉，
+        // 这样「每对两笔市价平仓」的外部成交量就没有了 —— 代价是单钱包敞口变大，需要足够的保证金。
+        // 串行执行：两个钱包的仓位方向相反，同时发市价单容易在同一档流动性上互撞，也会一次性
+        // 打满 relay 的读/写配额；串行更稳，且每笔失败都能拿到单独的原因。
+        if (inventoryOverThreshold(maker.id, cfg.market) || inventoryOverThreshold(taker.id, cfg.market)) {
+          hooks.log("◆ 单钱包净仓达到阈值，开始平仓");
+        }
+        await flattenIfOverThreshold(maker, cfg.market, hooks, short(maker));
+        await flattenIfOverThreshold(taker, cfg.market, hooks, short(taker));
+      } else if (MODE === "selfCross") {
+        // 平仓自成交：两条平仓腿互相对敲，成交在同一内沿价上 —— 不跨点差，且这对的成交量翻倍。
+        // 失败（点差不够 / 挂单被抢 / IOC 没吃到）就回退成市价平仓，保证不残留仓位。
+        const r = await closePairSelfCross(maker, taker, cfg.market, hooks, makerSide, takerSide, size);
+        if (r.ok) {
+          // 两边都归零了，把库存观察里的虚拟净仓同步清零
+          clearInventory(maker.id, cfg.market);
+          clearInventory(taker.id, cfg.market);
+          hooks.log(`↩ 平仓自成交：${short(taker)} 挂 ${makerSide} ↔ ${short(maker)} 吃 ${takerSide} @ ${r.price}（${(r.ms / 1000).toFixed(1)}s）`);
+        } else {
+          hooks.log(`⚠ 平仓自成交未完成（${r.error}），回退市价平仓`);
+          await Promise.all([
+            flattenWithRetry(maker.id, cfg.market, hooks, short(maker)),
+            flattenWithRetry(taker.id, cfg.market, hooks, short(taker)),
+          ]);
+        }
+      } else {
+        // 两个钱包的平仓互不依赖（不同钱包 = 不同 nonce lane），并行执行能把这段收尾时间砍掉一半。
+        await Promise.all([
+          flattenWithRetry(maker.id, cfg.market, hooks, short(maker)),
+          flattenWithRetry(taker.id, cfg.market, hooks, short(taker)),
+        ]);
+      }
     }
   } finally {
     endPriorityReads();
@@ -403,15 +596,32 @@ export async function runRound(makers: readonly WalletVM[], takers: readonly Wal
     if (i < pairs.length - 1) await sleepAbortable(PAIR_GAP_MS, hooks.signal);
   }
   hooks.log(`round complete: ${traded}/${pairs.length} traded${skipped ? `, ${skipped} skipped` : ""}${errors ? `, ${errors} error(s)` : ""}`);
+  // 库存观察：每轮末尾输出累计口径（虚拟净仓 / 峰值 / 阈值策略下能省多少），只打日志不干预交易。
+  for (const line of inventorySummary()) hooks.log(line);
   return { pairs: pairs.length, traded, skipped, errors };
 }
+
+/** 这批钱包的累计已实现盈亏（**不含手续费**）：直接读成交账本里逐笔的 realizedPnl
+ *  （本地 FIFO 配对，开仓成交记 0）。取两次采样的差值，就是这一轮的毛盈亏。 */
+function realizedPnlOf(walletIds: ReadonlySet<string>): number {
+  let sum = 0;
+  for (const r of accountingLedger.records) {
+    if (!walletIds.has(r.walletId)) continue;
+    if (typeof r.realizedPnl === "number" && Number.isFinite(r.realizedPnl)) sum += r.realizedPnl;
+  }
+  return sum;
+}
+
+/** 面板上保留的交易摘要：第几轮 + 本轮盈亏（手续费不在这里扣，另有账本统计）。 */
+const roundPnlLine = (round: number, pnl: number): string =>
+  `▶ round ${round} 完成｜本轮盈亏 ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} USDT0（不含手续费）`;
 
 /** Run rounds back to back until the signal aborts — the continuous benchmark loop behind the Run/Pause
  *  toggle. The round SIDE is re-rolled each round (so the maker cohort alternates between buying and
  *  selling over time), and abort is honored between rounds AND, via runRound, between pairs — so Pause
  *  stops within the current pair, not at the end of a long round. 对与对之间留 PAIR_GAP_MS 的间隔，
  *  命中限速时按倍数退避重试 —— 宁可慢一点，也不要因为 429 把整轮都跳过、甚至把 IP 打封。 */
-export async function runContinuous(makers: readonly WalletVM[], takers: readonly WalletVM[], base: Omit<RoundConfig, "makerBuys"> & { maxRounds?: number }, hooks: RoundHooks): Promise<void> {
+export async function runContinuous(makers: readonly WalletVM[], takers: readonly WalletVM[], base: Omit<RoundConfig, "makerBuys"> & { maxRounds?: number; hedge?: boolean; hedgeThreshold?: number; mode?: FlattenMode }, hooks: RoundHooks): Promise<void> {
   const net = activeNetwork();
   if (!net.isTestnet && !base.mainnetConfirmed) {
     hooks.log(MAINNET_UNCONFIRMED_MSG);
@@ -419,12 +629,33 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
   }
   const caps: Caps = { wallet: net.caps.walletUsdt0, cohort: net.caps.cohortUsdt0 };
   const state = freshCapState();
+  // 时钟预热：把第一次 ensureClockOffset 的 3 次 ping（dev 模式下还有 /api/nado/clock 的路由编译）
+  // 挪出下单关键路径 —— 实测首轮的「本地耗时」会因为它多出 3s 左右。
+  await ensureClockOffset().catch(() => {});
+  // 库存观察的统计口径 = 一次 run（Pause 后重跑会重新开始累计）
+  resetInventoryWatch();
+  // 模式选择：净额对冲时统计要跟踪「真实净仓」（不能被模拟截断），否则阈值判断会失准；
+  // 两种平仓模式都是「每对做完就归零」，净值只用于展示，保留模拟口径即可。
+  MODE = base.mode ?? (base.hedge === true ? "hedge" : "pair");
+  setInventorySimulation(MODE !== "hedge");
+  const threshold = base.hedgeThreshold && base.hedgeThreshold > 0 ? base.hedgeThreshold : INVENTORY_THRESHOLD_USDT0;
+  setInventoryThreshold(threshold);
+  hooks.log(
+    MODE === "hedge"
+      ? `◆ 模式：净额对冲 — 仓位留在钱包里互相抵消，单钱包净仓 ≥ ${threshold} USDT0 才平`
+      : MODE === "selfCross"
+        ? "◆ 模式：平仓自成交 — 平仓两腿互相对敲，不跨点差，自成交量翻倍"
+        : "◆ 模式：逐对平仓 — 每对结束都平掉两腿",
+  );
   // Eligibility: only wallets with collateral trade (orders are gasless, so gas isn't required). Snapshot
   // at run start — log each ineligible wallet once, then run the eligible subset.
+  // 这两个数组会被「余额失衡自动换角色」就地改元素（见 roleBalance.ts），所以用 const 存引用即可
   const eMakers = await eligible(makers, "maker", hooks);
   const eTakers = await eligible(takers, "taker", hooks);
   // 手动配对的名单也要过一遍「可交易」检查：任一腿不可用就跳过这一对，别拖累其它配对
   const pinned = base.manualPairs?.filter(([m, t]) => eMakers.includes(m) && eTakers.includes(t)) ?? [];
+  // 手动配对 = 用户把 maker/taker 角色定死了，余额自动平衡不去覆盖它
+  if (pinned.length) hooks.log("⚖ 手动配对已锁定角色，余额自动平衡不生效。");
   if (base.manualPairs?.length && pinned.length === 0) {
     hooks.log("■ 手动配对的钱包都不可交易（无抵押）——stopping.");
     hooks.log("■ stopped.");
@@ -437,14 +668,33 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
   }
   let round = 0;
   let noTrade = 0;
+  let thinSpread = 0; // 连续「点差不足」的轮次（不计入 noTrade）
+  // 本轮盈亏的采样基准。成交回执（WS）有一小段延迟，所以「上一轮的结算」放到下一轮开头再做：
+  // 既不用在轮次之间插等待，也不会把还没落账的成交算漏。
+  const runWalletIds = new Set([...eMakers, ...eTakers].map((w) => w.id));
+  let pnlMark: { round: number; base: number } | null = null;
+  // 取价改用 WS 的 all_bbo 快照：一轮一对的开头不再消耗 REST 读配额（per-IP ~2 次/秒），
+  // 排队造成的「round 开始 → maker 提交」空等随之消失。地址与页面点差监听同源。
+  const cfgForBbo = await getLiveConfig().catch(() => undefined);
+  if (cfgForBbo?.wsSubscribeUrl) startBboCache(cfgForBbo.wsSubscribeUrl);
   // 开跑之前先把这批钱包的残留仓位清掉（上一次运行被 Pause / 429 打断时可能留下敞口）。
   // closeAllPositionsLive 读一次持仓，再对每个非零仓位发 reduce-only 穿价 IOC，等同市价全平。
   await flattenAll([...eMakers, ...eTakers], hooks, "start");
+  // 余额检查只放在「开跑前」这一瞬间：此刻仓位已经被上面的 flattenAll 清零，
+  // 换角色不会出现「一半仓位在老角色、一半在新角色」的错位；跑起来之后不再中途改动。
+  if (!pinned.length) {
+    const swapped = await rebalanceRoles(eMakers, eTakers, hooks.log);
+    // 换了角色就立刻通知页面刷新钱包：否则面板上的 maker/taker 标签要等整轮跑完才变
+    if (swapped) hooks.onRolesChanged?.();
+  }
   while (!hooks.signal?.aborted) {
     round++;
+    // 结算上一轮（此时它的成交已经全部落账）
+    if (pnlMark) hooks.log(roundPnlLine(pnlMark.round, realizedPnlOf(runWalletIds) - pnlMark.base));
     hooks.onRoundStart?.();
     const makerBuys = Math.random() < 0.5;
     hooks.log(`▶ round ${round} — makers ${makerBuys ? "buy" : "sell"}`);
+    pnlMark = { round, base: realizedPnlOf(runWalletIds) };
     const r = await runRound(eMakers, eTakers, { ...base, makerBuys, manualPairs: pinned }, hooks, caps, state);
     // Stop when the run can't make progress: an empty cohort, a cohort that hit its cumulative cap, or a
     // run of consecutive rounds that trade nothing (a tight market or every wallet capped) — a single
@@ -453,12 +703,20 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
     // 用户指定了轮次上限（>0）时，跑满就停；0/未填表示一直跑到 Pause
     if (base.maxRounds && round >= base.maxRounds) { hooks.log(`■ ${round} round(s) done — stopping.`); break; }
     if (state.maker >= caps.cohort || state.taker >= caps.cohort) { hooks.log(`■ cohort spend cap ($${caps.cohort}) reached — stopping.`); break; }
-    noTrade = r.traded === 0 ? noTrade + 1 : 0;
+    // 点差不足单独计数（见 THIN_SPREAD_LIMIT）：不算引擎故障，只是市场暂时没有内沿空间，
+    // 所以这类轮次不计入 noTrade（否则盘口一收窄照样 3 轮退场）。
+    const thinRound = r.traded === 0 && r.skipped > 0 && r.errors === 0;
+    noTrade = r.traded > 0 ? 0 : thinRound ? noTrade : noTrade + 1;
     if (noTrade >= NO_TRADE_LIMIT) { hooks.log(`■ no pairs traded in ${NO_TRADE_LIMIT} rounds — stopping.`); break; }
+    thinSpread = thinRound ? thinSpread + 1 : 0;
+    if (thinSpread >= THIN_SPREAD_LIMIT) { hooks.log(`■ 点差连续 ${THIN_SPREAD_LIMIT} 轮不足 ${MIN_SPREAD_TICKS} tick — stopping.`); break; }
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
   // 循环结束（跑满轮次 / 提前停止 / Pause）后再清扫一遍：有未平仓位就市价全部平掉，
   // 不留敞口给下一次运行。这里不带 signal，Pause 也会照常执行。
   await flattenAll([...eMakers, ...eTakers], hooks, "end");
+  // 收尾平仓的单子也可能就是这个 run 的最后成交：停之前把最后一轮的盈亏补上
+  if (pnlMark) hooks.log(roundPnlLine(pnlMark.round, realizedPnlOf(runWalletIds) - pnlMark.base));
+  stopBboCache(); // 收尾后关掉行情订阅（页面自己的点差监听不受影响）
   hooks.log("■ stopped.");
 }

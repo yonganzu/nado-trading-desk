@@ -24,6 +24,7 @@ import { getLiveConfig, productFor } from "./liveConfig";
 import type { LiveConfig, LiveProductVM } from "./liveConfig";
 import type { TriggerPriceType } from "./strategySignalModel";
 import { activeNetwork } from "./chainEnv";
+import { serverNow, ensureClockOffset } from "./nadoClock";
 
 // Mutable per-operation chain config, mirrored from the SELECTED network. A live network switch
 // calls refreshNetwork() so the in-tab money path (chainId / RPC / USDT0 / caps) tracks the UI
@@ -219,6 +220,10 @@ const submitted = new Map<string, Order>();
 // persisted job store (recover-after-reload) is ever adopted this map must be persisted too,
 // else a post-reload retry re-mints and the double-place returns (tracked follow-up).
 const ORDER_TTL_SECS = 7 * 24 * 60 * 60; // the order's expiration (resting-maker default); the re-place window is the ~90s recvTime
+// nonce 里的 recvTime 必须「提前」于 sequencer 的实际收到时刻：SDK 默认就是 now + 90s。
+// 一旦只给 now（哪怕按服务器时钟校正过），请求到达时就已经晚于 recv_time → 2011 LATE_RECV_EXECUTION。
+// 所以校正后的时间仍要加上这 90s 余量；>100s 会被判 2012（提前过多），所以严格沿用 90s。
+const ORDER_RECV_LEAD_MS = 90_000;
 interface StableOrder { nonce: string; expiration: string; price: string; size: string; reduceOnly?: boolean }
 const orderParamStore = new Map<string, StableOrder>();
 
@@ -281,9 +286,11 @@ export async function placeOrderLive(walletId: string, marketId: string | undefi
     // Size is resolved AFTER the price so clampSize can bump it up to clear the market's min
     // NOTIONAL at this price (Nado's `minSize` is a USDT0 notional floor, not a base size).
     const size = clampSize(product, opts.size, price);
+    // 时钟对齐：expiration 按 sequencer 时间算；nonce 的 recvTime = 校正时间 + 90s（见 ORDER_RECV_LEAD_MS）。
+    await ensureClockOffset().catch(() => {});
     // reduceOnly is a digest field (it sets the appendix bit), so it is part of the stable
     // per-jobId order too — a retry reuses the first value and stays byte-identical.
-    built = { price, size, reduceOnly: opts.reduceOnly, nonce: String(getOrderNonce()), expiration: String(Math.floor(Date.now() / 1000) + ORDER_TTL_SECS) };
+    built = { price, size, reduceOnly: opts.reduceOnly, nonce: String(getOrderNonce(serverNow() + ORDER_RECV_LEAD_MS)), expiration: String(Math.floor(serverNow() / 1000) + ORDER_TTL_SECS) };
     if (idemKey) orderParamStore.set(idemKey, built);
   }
   // Spend cap: reject (never clamp) an order whose notional exceeds the ceiling. Computed from
@@ -485,14 +492,23 @@ export async function closeAllPositionsLive(walletId: string, signal?: AbortSign
 }
 
 /** Flatten the wallet's position on a market with an opposite crossing IOC, IN-TAB. */
-export async function closePositionLive(walletId: string, marketId: string | undefined, signal?: AbortSignal): Promise<{ closed: number; order?: Order; side?: "buy" | "sell" }> {
-  if (signal?.aborted) throw new Error("aborted");
+/** 读某钱包在某市场的带符号持仓数量（多正空负）。平仓后用它能确认「是否真的平掉了」——
+ *  只看下单是否成功是不够的：薄盘上的 IOC 可能一笔都没成交。 */
+export async function readPositionSizeLive(walletId: string, marketId: string | undefined): Promise<number> {
   const { live, cfg } = await liveFor(walletId);
   const product = productFor(cfg, marketId);
   if (!product) throw new Error(`未知品种 ${marketId ?? ""}：控制台的 products 里没有匹配的 marketId/symbol`);
   const positions = await live.adapter.trading.getPositions(live.ctx.account);
   const pos = positions.find((p) => p.market === product.marketId);
-  const amt = pos ? Number(pos.size) * (pos.side === "short" ? -1 : 1) : 0;
+  return pos ? Number(pos.size) * (pos.side === "short" ? -1 : 1) : 0;
+}
+
+export async function closePositionLive(walletId: string, marketId: string | undefined, signal?: AbortSignal): Promise<{ closed: number; order?: Order; side?: "buy" | "sell" }> {
+  if (signal?.aborted) throw new Error("aborted");
+  const { live, cfg } = await liveFor(walletId);
+  const product = productFor(cfg, marketId);
+  if (!product) throw new Error(`未知品种 ${marketId ?? ""}：控制台的 products 里没有匹配的 marketId/symbol`);
+  const amt = await readPositionSizeLive(walletId, marketId);
   if (!(Math.abs(amt) > 0)) return { closed: 0 };
   const side: "buy" | "sell" = amt > 0 ? "sell" : "buy";
   // reduceOnly: the venue caps the fill at the position, so a crossing IOC on a thin book

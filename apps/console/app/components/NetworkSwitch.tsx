@@ -11,8 +11,9 @@ const MAINNET = 57073;
 
 /** 单按钮版网络切换：只显示「当前网络」，点一下就切到另一个网络（不再并排显示两网按钮）。
  *  切到 TESTNET 立即生效；切回 MAINNET 仍然先弹确认框（真实资金，且确认按钮带主网配色）。
- *  网络选择是客户端 + 服务端共读的 cookie，所以切换即时生效、不用重启。 */
-export function NetworkSwitch() {
+ *  网络选择是客户端 + 服务端共读的 cookie，所以切换即时生效、不用重启。
+ *  inline：紧凑形态（去掉 "Network" 标签、不占满宽度），用于塞进侧栏标题右边。 */
+export function NetworkSwitch({ inline = false }: { inline?: boolean } = {}) {
   const { chainId, setChain } = useNetwork();
   const [confirm, setConfirm] = useState(false);
 
@@ -26,15 +27,15 @@ export function NetworkSwitch() {
   };
 
   return (
-    <div className="flex flex-col gap-2">
-      <span className="text-sm font-medium text-kumo-subtle">Network</span>
+    <div className={inline ? "shrink-0" : "flex flex-col gap-2"}>
+      {!inline && <span className="text-sm font-medium text-kumo-subtle">Network</span>}
       {/* 只保留一个按钮：显示当前网络名，点击 = 切到另一个网络 */}
       <Button
-        size="sm"
+        size={inline ? "xs" : "sm"}
         variant="primary"
         title={`当前 ${current}，点击切换到 ${NETWORKS[other]?.networkName ?? ""}`}
         aria-label={`网络：当前 ${current}，点击切换`}
-        className="w-full capitalize"
+        className={inline ? "shrink-0 capitalize" : "w-full capitalize"}
         onClick={() => pick(other)}
       >
         {current}

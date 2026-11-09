@@ -6,6 +6,8 @@ import { ArrowCounterClockwiseIcon, DownloadSimpleIcon, ReceiptIcon } from "@pho
 import { rollup, toCsv, toJson, MAKER_VOLUME_PER_POINT, TAKER_VOLUME_PER_POINT } from "@farm/ui";
 import type { Rollup, Totals } from "@farm/ui";
 import { accountingLedger } from "../lib/accountingLedger";
+import { withoutExcludedWallets } from "../lib/accountingExclusions";
+import { PointCostChart } from "./PointCostChart";
 
 function download(filename: string, content: string, type: string): void {
   const blob = new Blob([content], { type });
@@ -32,6 +34,9 @@ function Stat({ label, value, tone }: { label: string; value: string; tone?: "up
 function signed(n: number): string {
   return `${n > 0 ? "+" : ""}${n.toFixed(4)}`;
 }
+
+/** 积分估值（美元/分）。用来估算「积分价值 − 实际损耗」的盈亏；价格变动时只改这里。 */
+const POINT_PRICE_USD = 1.2;
 
 /** One rollup as a Kumo Table (compact sticky header) inside a height-capped scroll region. */
 function RollupTable({ title, rows, keyLabel }: { title: string; rows: Rollup[]; keyLabel: string }) {
@@ -187,7 +192,8 @@ export function AccountingView({ open, onClose, subaccounts = [] }: { open: bool
     void loadHistory();
   }, [open, subsKey, loadHistory]);
 
-  const records = accountingLedger.records;
+  // 排除名单里的钱包（见 accountingExclusions）：汇总、表格、折线图、导出都基于过滤后的记录
+  const records = withoutExcludedWallets(accountingLedger.records);
   const report = open ? rollup(records) : null;
   const t = report?.totals;
 
@@ -200,16 +206,12 @@ export function AccountingView({ open, onClose, subaccounts = [] }: { open: bool
           {report && t && (
             // pt-1: Body is a scroll container with no top padding, which clipped the stat cards' ring.
             <div className="flex flex-col gap-4 pt-1">
+              {/* 只保留用户关心的口径：挂/吃成交量、挂/吃手续费、积分、积分成本、手续费以外的损耗 */}
               <Grid variant="4up" gap="sm">
-                <Stat label="Orders (fills)" value={String(t.orders)} />
-                <Stat label="Volume" value={t.volume.toFixed(2)} />
-                <Stat label="Buy / sell" value={`${t.buys} / ${t.sells}`} />
-              </Grid>
-              <Grid variant="4up" gap="sm">
-                <Stat label="Maker fees" value={t.makerFees.toFixed(4)} />
-                <Stat label="Taker fees" value={t.takerFees.toFixed(4)} />
-                <Stat label="Fees (ex-PnL)" value={t.fees.toFixed(4)} />
-                <Stat label="Realized PnL" value={signed(t.pnl)} tone={t.pnl > 0 ? "up" : t.pnl < 0 ? "down" : undefined} />
+                <Stat label="Maker volume（挂单成交量）" value={t.makerVolume.toFixed(2)} />
+                <Stat label="Taker volume（吃单成交量）" value={t.takerVolume.toFixed(2)} />
+                <Stat label="Maker fees（挂单手续费）" value={t.makerFees.toFixed(4)} />
+                <Stat label="Taker fees（吃单手续费）" value={t.takerFees.toFixed(4)} />
               </Grid>
               <Grid variant="4up" gap="sm">
                 {/* 积分口径：挂单每 16000 名义额 1 分、吃单每 2500 名义额 1 分，按比例累计 */}
@@ -217,12 +219,39 @@ export function AccountingView({ open, onClose, subaccounts = [] }: { open: bool
                   label={`积分（挂单 ${(t.makerVolume / MAKER_VOLUME_PER_POINT).toFixed(2)} + 吃单 ${(t.takerVolume / TAKER_VOLUME_PER_POINT).toFixed(2)}）`}
                   value={`${t.points.toFixed(2)} 分`}
                 />
-                <Stat label="Wear (fees − PnL)" value={t.wear.toFixed(4)} tone={t.wear > 0 ? "down" : "up"} />
-                <Stat label="Maker / Taker (fills)" value={`${t.makerOrders} / ${t.takerOrders}`} />
-                {t.unclassifiedOrders > 0 && (
-                  <Stat label="Maker/Taker 未知" value={String(t.unclassifiedOrders)} />
-                )}
+                {/* 积分成本 = Wear ÷ 积分，Wear 已含手续费 + 开平仓盈亏 */}
+                <Stat
+                  label="积分成本（Wear ÷ 积分）"
+                  value={t.points > 0 ? (t.wear / t.points).toFixed(4) : "—"}
+                  tone={t.points > 0 && t.wear > 0 ? "down" : undefined}
+                />
+                {/* 手续费以外的损耗 = Wear − 手续费 = −已实现盈亏（正数=价差亏损，负数=价差盈利） */}
+                <Stat
+                  label="手续费以外的损耗（−PnL）"
+                  value={(t.wear - t.fees).toFixed(4)}
+                  tone={t.wear - t.fees > 0 ? "down" : t.wear - t.fees < 0 ? "up" : undefined}
+                />
+                {/* 总计损耗 = Wear = 手续费 + 价差损耗（= 手续费 − 已实现盈亏），也就是拿积分前实际花掉的总成本 */}
+                <Stat
+                  label="总计损耗（手续费 + 价差）"
+                  value={t.wear.toFixed(4)}
+                  tone={t.wear > 0 ? "down" : t.wear < 0 ? "up" : undefined}
+                />
+                {/* 预计盈亏 = 积分价值 − 总损耗（Wear 已含手续费和开平仓盈亏）；正=赚，负=亏 */}
+                <Stat
+                  label={`预计盈亏（积分 @ ${POINT_PRICE_USD} 美元/分）`}
+                  value={signed(t.points * POINT_PRICE_USD - t.wear)}
+                  tone={
+                    t.points * POINT_PRICE_USD - t.wear > 0
+                      ? "up"
+                      : t.points * POINT_PRICE_USD - t.wear < 0
+                        ? "down"
+                        : undefined
+                  }
+                />
               </Grid>
+              {/* 积分成本走势：线色按最近 10 单是否超过 1.2 美元/分切换 */}
+              <PointCostChart records={records} />
               {records.length > 0 && <SplitTable totals={t} />}
               {records.length === 0 ? (
                 <Empty

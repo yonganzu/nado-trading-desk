@@ -50,7 +50,11 @@ export function Sidebar(props: Props) {
         {props.railOpen ? (
           <div className="flex w-full items-center justify-between gap-2">
             <div className="flex min-w-0 flex-col">
-              <Text variant="heading" as="span">Nado Trading Desk</Text>
+              {/* 标题右侧放网络切换按钮（原来在下方内容区，挪上来更顺手、也不占纵向空间） */}
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <Text variant="heading" as="span">Nado Trading Desk</Text>
+                <NetworkSwitch inline />
+              </div>
               <Text variant="secondary" size="xs" as="span">Fleet console · {props.workspaceName}</Text>
             </div>
             <button
@@ -86,8 +90,6 @@ export function Sidebar(props: Props) {
             customValue={`${props.shownWallets} / ${props.totalWallets}`}
             showValue
           />
-
-          <NetworkSwitch />
 
           <div className="flex flex-col gap-2">
             <Label>Accounts</Label>

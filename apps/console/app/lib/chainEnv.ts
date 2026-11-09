@@ -54,9 +54,10 @@ export const NETWORKS: Record<number, NetworkConfig> = {
     chainId: MAINNET, isTestnet: false, label: "Ink", networkName: "mainnet",
     rpc: "https://rpc-gel.inkonchain.com",                     // CORS-open (verified 2026-10-18)
     usdt0: "0x0200C29006150606B650577BBE7B6248F58470c1",       // mainnet USDT0 (6-dec, verified 2026-10-18)
-    // 单钱包 / cohort 的累计上限都已取消（跑多轮时 cohort 会很快攒到 1000 USDT0 而误报）。
-    // 真正的护栏还在：单笔 notional 上限（order: 150）依然生效。
-    caps: caps({ order: 150, deposit: 200, refuel: 0.005, cohort: Number.POSITIVE_INFINITY, wallet: Number.POSITIVE_INFINITY }),
+    // 单笔 notional、单钱包、cohort 的累计上限全部取消（都设为 Infinity）：
+    // 按单笔 150 的上限，Volume/pair 想开 300 会被直接拒掉，调仓节奏完全没法用。
+    // 环境变量 NEXT_PUBLIC_NADO_MAX_* 仍然有效 —— 需要收紧时设置它即可重新拿到护栏。
+    caps: caps({ order: Number.POSITIVE_INFINITY, deposit: 200, refuel: 0.005, cohort: Number.POSITIVE_INFINITY, wallet: Number.POSITIVE_INFINITY }),
   },
 };
 

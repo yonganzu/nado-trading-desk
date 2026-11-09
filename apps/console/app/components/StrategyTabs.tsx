@@ -37,7 +37,7 @@ export function StrategyTabs({ wallets, liveMarkets, isLive = false, onWalletCha
 
   const tabs: Array<{ id: Tab; label: string }> = [
     { id: "bulk", label: "Bulk action" },
-    { id: "strategy", label: "Trading strategy" },
+    { id: "strategy", label: "自成交平仓" },
   ];
 
   return (

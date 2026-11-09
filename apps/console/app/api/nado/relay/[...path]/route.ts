@@ -3,9 +3,10 @@
 // sequencer and returns the response. It holds NO key and does no signing — it only
 // exists because the sequencer refuses cross-origin browser requests (CORS 403). This
 // is the custody-free server the graduation demotes the old server-key route toward.
+// 主网转发到 direct 网关（东京同机房，比官方边缘域名少一跳），测试网/回退走官方端点。
 import { NextResponse } from "next/server";
-import { CHAIN_ID_TO_CHAIN_ENV, ENGINE_CLIENT_ENDPOINTS } from "@nadohq/client";
 import { chainIdFromCookieHeader } from "../../../../lib/chainEnv"; // per-request network from the cookie
+import { engineBaseUrl } from "../../../../lib/nadoEndpoints";      // direct 网关 / 官方端点二选一
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -46,7 +47,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ path?: string[
   const seg = (path ?? []).join("/");
   if (!ALLOW.has(seg)) return NextResponse.json({ error: `relay path '${seg}' not allowed` }, { status: 400 });
   // Forward to the sequencer for the SELECTED network (from the cookie), resolved per request.
-  const BASE = ENGINE_CLIENT_ENDPOINTS[CHAIN_ID_TO_CHAIN_ENV[chainIdFromCookieHeader(req.headers.get("cookie"))]!];
+  // 主网 = direct 网关（东京同机房），测试网 = 官方端点。
+  const BASE = engineBaseUrl(chainIdFromCookieHeader(req.headers.get("cookie")));
   const body = await req.text(); // opaque: a signed execute payload or a public query
   try {
     for (let attempt = 0; ; attempt++) {

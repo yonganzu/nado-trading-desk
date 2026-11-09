@@ -16,6 +16,7 @@ import { shuffle } from "../lib/rand";
 import { useNetwork } from "./NetworkProvider";
 import { automationProgress } from "../lib/automationProgress";
 import { readPref, writePref } from "../lib/prefs";
+// 模式固定为「自成交平仓」，库存阈值输入已下线（引擎侧默认值仍在 inventoryWatch 里）
 import { ConfirmDialog } from "./ConfirmDialog";
 
 /** The trade symbol from a market id — the part after the ":" (e.g. "nado:perp:BTC-PERP" → "BTC-PERP"). */
@@ -52,6 +53,7 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
   const [marketListOpen, setMarketListOpen] = useState(false);
   // run automation 的轮次：0 或空表示一直跑到 Pause
   const [rounds, setRounds] = useState("0");
+  // 收尾方式固定为「平仓自成交」：面板不再提供模式切换（逐对平仓 / 净额对冲的实现留在引擎里）。
   // 本地偏好（区间数字 / 展开状态）是否已恢复：恢复前不回写，避免默认值盖掉已保存的值
   const [prefsReady, setPrefsReady] = useState(false);
   const [busy, setBusy] = useState(false);     // the Cohort split is in flight
@@ -137,13 +139,19 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
     if (max !== null) setMaxVol(max);
     const r = readPref("rounds");
     if (r !== null) setRounds(r);
+    // 上次选中的标的也一起恢复（marketText 同步回填，否则首屏搜索框是空的）。
+    // 若这个标的已被点差过滤掉，下面的自动选标的逻辑会退回到 BTC-PERP。
+    const mk = readPref("market");
+    if (mk) { setMarket(mk); setMarketText(symbolOf(mk)); }
     setPrefsReady(true);
   }, []);
 
-  // 把「区间数字 / 轮次」落到本地，下次打开页面自动恢复
+  // 把「区间数字 / 轮次 / 标的」落到本地，下次打开页面自动恢复
   useEffect(() => { if (prefsReady) writePref("vol.min", minVol); }, [minVol, prefsReady]);
   useEffect(() => { if (prefsReady) writePref("vol.max", maxVol); }, [maxVol, prefsReady]);
   useEffect(() => { if (prefsReady) writePref("rounds", rounds); }, [rounds, prefsReady]);
+  // market 为空表示还没选（首屏），不写，避免把已保存的值盖成空串
+  useEffect(() => { if (prefsReady && market) writePref("market", market); }, [market, prefsReady]);
 
   // Stop an in-flight run if the panel unmounts (e.g. a future navigation), so no orphaned loop keeps
   // placing and the shared progress store doesn't stay stuck "running".
@@ -151,6 +159,8 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
 
   // 每条日志带上本地时间戳（HH:mm:ss.SSS），方便把「报错时间」和「成交时间」对上；
   // 同时异步落盘到服务端（.data/automation.log），刷新页面后仍可事后排查。
+  // 面板里的日志框只留摘要（第几轮 + 本轮盈亏 + 停止原因），逐对的明细仍然全量写进文件日志。
+  const PANEL_ONLY = /^▶ round \d+|^■ |^⚖ |^⇄ /;
   const append = (m: string) => {
     const d = new Date();
     const hh = String(d.getHours()).padStart(2, "0");
@@ -158,7 +168,7 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
     const ss = String(d.getSeconds()).padStart(2, "0");
     const ms = String(d.getMilliseconds()).padStart(3, "0");
     const line = `${hh}:${mm}:${ss}.${ms} ${m}`;
-    setLog((l) => [line, ...l].slice(0, 40));
+    if (PANEL_ONLY.test(m)) setLog((l) => [line, ...l].slice(0, 40));
     void fetch("/api/logs", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -228,32 +238,57 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
     return () => { cancelled = true; };
   }, [market, probeWalletId, isLive]);
 
-  // The Cohort pre-step: randomly split the UN-cohorted wallets 50/50 into maker/taker (manual picks
-  // untouched; an odd one out stays unassigned). 只处理「选中的钱包组」内的钱包，组外的钱包不参与。
-  // Writes are sequential — each setWalletCohort read-modify-
-  // writes the shared vault tag store, so parallel would race. A pool of <2 can't form a pair, so it's a
-  // no-op. If a write fails mid-loop we report how many actually landed (the skew is real, surfaced not
-  // hidden) and still repaint, so the button's M/T count reflects persisted truth and a re-run finishes.
+  // The Cohort pre-step: BALANCE the selected group so maker / taker counts match (odd count → differ by 1).
+  // 与旧逻辑的区别：不再只切「未分组」的钱包，而是把两边数量拉平 —— 已有角色尽量保留，只把超出的一半
+  // 挪到另一边（不够时从未分组里补），所以反复点击可以修正 6M/2T 这类偏斜；已经完全平衡时什么都不写。
+  // Writes are sequential — each setWalletCohort read-modify-writes the shared vault tag store, so parallel
+  // would race. If a write fails mid-loop we report how many actually landed and still repaint.
   const runCohortSplit = async () => {
-    // 只切「勾选进来、还没分组」的钱包；组内已有角色的钱包不重复切分
-    const unassigned = shuffle(wallets.filter((w) => !w.cohort));
-    if (unassigned.length < 2) {
-      append(unassigned.length ? "Only 1 un-cohorted wallet in the selection — need ≥2 to form a maker/taker pair." : "Nothing to split — every selected wallet already has a cohort.");
+    const total = wallets.length;
+    if (total < 2) {
+      append(total ? "Only 1 wallet selected — need ≥2 to form a maker/taker pair." : "Select wallets first, then re-run Cohort.");
       return;
     }
-    const half = Math.floor(unassigned.length / 2);
-    const plan = [
-      ...unassigned.slice(0, half).map((w) => [w, "maker"] as const),
-      ...unassigned.slice(half, half * 2).map((w) => [w, "taker"] as const),
-    ];
+    const half = Math.floor(total / 2);
+    // 奇数时多出来的那一个随机给一边，避免每次都偏向 maker
+    const targetM = half + (total % 2 && Math.random() < 0.5 ? 1 : 0);
+    const targetT = total - targetM;
+
+    const curM = shuffle(wallets.filter((w) => w.cohort === "maker"));
+    const curT = shuffle(wallets.filter((w) => w.cohort === "taker"));
+    const keepM = curM.slice(0, targetM);   // 保留原角色的部分（不产生写操作）
+    const keepT = curT.slice(0, targetT);
+    // 需要重新分配角色的：两边超出的部分 + 尚未分组的
+    const spare = shuffle([
+      ...curM.slice(targetM),
+      ...curT.slice(targetT),
+      ...wallets.filter((w) => !w.cohort),
+    ]);
+    const plan: Array<{ w: (typeof wallets)[number]; cohort: "maker" | "taker" }> = [];
+    let needM = targetM - keepM.length;
+    let needT = targetT - keepT.length;
+    for (const w of spare) {
+      if (needM > 0) { plan.push({ w, cohort: "maker" }); needM--; }
+      else if (needT > 0) { plan.push({ w, cohort: "taker" }); needT--; }
+      else break;
+    }
+    if (plan.length === 0) {
+      // 完全平衡（或只差 1 个、且多出来的已经在某一侧）时不做任何写操作，按真实数量回报
+      append(`✓ already balanced：${curM.length} maker / ${curT.length} taker，无需调整。`);
+      return;
+    }
     setBusy(true);
     let done = 0;
+    let toMaker = 0;
     try {
-      for (const [w, cohort] of plan) { await setWalletCohort(w.id, cohort); done++; }
-      append(`✓ split ${plan.length} wallet(s): ${half} maker / ${half} taker${unassigned.length % 2 ? " · 1 left unassigned" : ""}`);
+      for (const step of plan) {
+        await setWalletCohort(step.w.id, step.cohort);
+        done++;
+        if (step.cohort === "maker") toMaker++;
+      }
+      append(`✓ balanced ${plan.length} wallet(s) → ${keepM.length + toMaker} maker / ${keepT.length + (done - toMaker)} taker`);
     } catch (e) {
-      const m = Math.min(done, half);
-      append(`✗ split stopped at ${done}/${plan.length} (${m} maker / ${done - m} taker) — re-run to finish: ${(e as Error).message}`);
+      append(`✗ balance stopped at ${done}/${plan.length} (kept ${keepM.length}M / ${keepT.length}T) — re-run to finish: ${(e as Error).message}`);
     } finally {
       setBusy(false);
       onWalletChanged?.();
@@ -321,12 +356,14 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
     const pairLabel = pinned.length > 0 ? `${pinned.length} 对（手动配对）` : `${Math.min(makers.length, takers.length)} pair(s)/round`;
     append(`▶ start — ${pairLabel} @ ${symbolOf(market)}${mainnetConfirmed ? " · MAINNET" : ""}`);
     try {
-      await runContinuous(makers, takers, { market, minNotional: min, maxNotional: max, mainnetConfirmed, maxRounds: Number(rounds) || 0, manualPairs: pinned }, {
+      await runContinuous(makers, takers, { market, minNotional: min, maxNotional: max, mainnetConfirmed, maxRounds: Number(rounds) || 0, manualPairs: pinned, mode: "selfCross" }, {
         log: append,
         signal: ctrl.signal,
         onRoundStart: () => automationProgress.roundStart(),
         onPairStart: (pair) => automationProgress.pairStart(pair),
         onPairEnd: (pair, outcome, ms) => { automationProgress.pairEnd(pair); if (outcome === "traded") recordPair(ms); },
+        // 开跑前的余额检查若换了角色，立刻刷新钱包列表，maker/taker 标签即时更新
+        onRolesChanged: () => onWalletChanged?.(),
       });
     } catch (e) {
       append(`✗ automation error: ${(e as Error).message}`);
@@ -342,6 +379,12 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
 
   return (
     <div className="flex flex-col gap-3">
+      {/* 栏目说明：面板标题已是「自成交平仓」，这里说明它的含义（原来的模式按钮已删掉，
+          逐对平仓 / 净额对冲的实现仍保留在 automation.ts 里，随时可以放回来）。 */}
+      <Text variant="secondary" size="xs">
+        自成交平仓：平仓两条腿也互相对敲（上一轮的吃单方挂单、挂单方去吃），不跨点差、自成交量翻倍；挂单被抢或没吃到时自动回退市价平仓。
+      </Text>
+
       {/* Point 1 — the per-pair volume range (each pair draws a random USDT0 notional in [min, max]). */}
       <div className="flex flex-col gap-1.5">
         <span className="text-sm font-medium">Volume / pair (USDT0)</span>
@@ -447,7 +490,7 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
         <Button size="sm" variant="secondary" loading={busy} onClick={runCohortSplit}>
           Cohort · {makerCount}M / {takerCount}T
         </Button>
-        <Text variant="secondary" size="xs">Step 1 — split un-cohorted wallets in the group 50/50 before running.</Text>
+        <Text variant="secondary" size="xs">Step 1 — 把已选钱包平衡成 maker / taker 数量相等（奇数时差 1）；已有分组尽量保留，可反复点。</Text>
         {/* 手动指定角色 / 配对已迁到右侧钱包栏顶部的「挂单 / 吃单」配对板 */}
       </div>
 
@@ -500,7 +543,7 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
       <ConfirmDialog
         open={confirmOpen}
         title="Run automation on MAINNET?"
-        danger={<>Live orders on Ink mainnet move <strong className="font-medium text-kumo-default">real USDT0</strong>. Caps: {net.caps.orderNotionalUsdt0}/order · {Number.isFinite(net.caps.walletUsdt0) ? net.caps.walletUsdt0 : "∞"}/wallet · {Number.isFinite(net.caps.cohortUsdt0) ? net.caps.cohortUsdt0 : "∞"}/cohort.</>}
+        danger={<>Live orders on Ink mainnet move <strong className="font-medium text-kumo-default">real USDT0</strong>. Caps: {Number.isFinite(net.caps.orderNotionalUsdt0) ? net.caps.orderNotionalUsdt0 : "∞"}/order · {Number.isFinite(net.caps.walletUsdt0) ? net.caps.walletUsdt0 : "∞"}/wallet · {Number.isFinite(net.caps.cohortUsdt0) ? net.caps.cohortUsdt0 : "∞"}/cohort.</>}
         body={<>Each pair self-crosses at the spread mid and flattens; the run continues until you pause.</>}
         confirmWord="RUN"
         onConfirm={() => { setConfirmOpen(false); void startRun(true); }}
