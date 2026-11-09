@@ -10,9 +10,6 @@ import { exportEvmPrivateKeys } from "./custody";
 import type { ExportedEvmKey } from "./custody";
 import type { NadoLoginJobView } from "./nadoLoginTypes";
 
-/** 登录成功后浏览器窗口保留的时长（留给用户操作 / 查看登录态）。 */
-export const NADO_KEEP_OPEN_MS = 180_000;
-
 const POLL_MS = 1_500;
 const TIMEOUT_MS = 150_000;
 
@@ -43,7 +40,8 @@ export async function openWalletOnNado(accountSlug: string, address: string): Pr
     const res = await fetch("/api/nado/login", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ wallets: [key], keepOpenMs: NADO_KEEP_OPEN_MS, accountSlug }),
+      // 登录成功后不自动关窗：浏览器一直留着，交由用户自己操作 / 关闭
+      body: JSON.stringify({ wallets: [key], keepOpenUntilClosed: true, accountSlug }),
     });
     const started = (await res.json().catch(() => ({}))) as { jobId?: string; error?: string };
     if (!res.ok || !started.jobId) {

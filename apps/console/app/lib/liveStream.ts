@@ -12,6 +12,13 @@ export interface LiveEvent {
   digest?: string;
   amount?: string;
   reason?: string;
+  // fill 帧的成交明细（供 Accounting 账本消费；单位按原始字符串保留，由账本归一化）
+  productId?: number;
+  price?: string;
+  size?: string;
+  fee?: string;
+  isTaker?: boolean;
+  isBid?: boolean;
   ts: number;
   raw: unknown;
 }
@@ -62,6 +69,12 @@ export function openLiveStream(opts: {
             digest: (m["digest"] ?? m["order_digest"]) as string | undefined,
             amount: (m["amount"] ?? m["filled_qty"]) as string | undefined,
             reason: m["reason"] as string | undefined,
+            productId: typeof m["product_id"] === "number" ? (m["product_id"] as number) : undefined,
+            price: m["price"] as string | undefined,
+            size: m["filled_qty"] as string | undefined,
+            fee: m["fee"] as string | undefined,
+            isTaker: typeof m["is_taker"] === "boolean" ? (m["is_taker"] as boolean) : undefined,
+            isBid: typeof m["is_bid"] === "boolean" ? (m["is_bid"] as boolean) : undefined,
             ts: Date.now(), raw: m,
           });
         }

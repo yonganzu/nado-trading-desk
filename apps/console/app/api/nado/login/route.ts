@@ -21,13 +21,15 @@ export async function POST(req: Request) {
   if (!isLocalRequest(req)) return NextResponse.json({ error: "only localhost may start login jobs" }, { status: 403 });
 
   const body = (await req.json().catch(() => null)) as {
-    wallets?: unknown; keepOpenMs?: unknown; mode?: unknown; accountSlug?: unknown; concurrency?: unknown; headless?: unknown;
+    wallets?: unknown; keepOpenMs?: unknown; keepOpenUntilClosed?: unknown; mode?: unknown; accountSlug?: unknown; concurrency?: unknown; headless?: unknown;
   } | null;
   const raw = Array.isArray(body?.wallets) ? body.wallets : [];
   if (raw.length === 0) return NextResponse.json({ error: "wallets is empty" }, { status: 400 });
   if (raw.length > MAX_WALLETS) return NextResponse.json({ error: `too many wallets (max ${MAX_WALLETS})` }, { status: 400 });
   // 「登录并查看」模式：把浏览器窗口保留一段时间（0 ~ 10 分钟）
   const keepOpenMs = Math.max(0, Math.min(600_000, Number(body?.keepOpenMs) || 0));
+  // 「留窗直到手动关闭」：登录成功后不自动关闭浏览器，由用户自己关窗（钱包面板的「登录网页」用它）
+  const keepOpenUntilClosed = body?.keepOpenUntilClosed === true;
   // "check" = 只检查注册状态（无头）；默认 = 完整登录 + 注册引导
   const mode = body?.mode === "check" ? "check" : "login";
   // 账户 slug 只用于登记表归类（不参与自动化）
@@ -47,7 +49,7 @@ export async function POST(req: Request) {
     keys.push({ index: typeof w?.index === "number" && Number.isInteger(w.index) ? w.index : i, address, privateKey });
   }
 
-  const job = startNadoLoginJob(keys, keepOpenMs, mode, accountSlug, concurrency, headless);
+  const job = startNadoLoginJob(keys, keepOpenMs, mode, accountSlug, concurrency, headless, keepOpenUntilClosed);
   return NextResponse.json({ jobId: job.id, total: job.total });
 }
 

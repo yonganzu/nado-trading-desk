@@ -16,3 +16,7 @@ playwright/.cache/
 # 每个钱包的 Nado 注册结果登记表（本机数据，含地址与用户名）
 .nado-registry.json
 .nado-registry.json.*.tmp
+# 本机账本（含子账户地址、逐笔成交与盈亏，属个人交易数据，不入库）
+apps/console/.data/
+# 临时排查脚本
+apps/console/.tmp-*

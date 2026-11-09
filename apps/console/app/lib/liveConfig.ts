@@ -35,11 +35,30 @@ export function getLiveConfig(force = false): Promise<LiveConfig> {
   return cfgP;
 }
 
-/** Look up a product by marketId (falls back to the default product). */
+/** 按 marketId / symbol / productId 找品种。
+ *
+ *  没传品种（页面手动下单用默认品种）时才回退 defaultProduct；
+ *  一旦指定了品种却查不到就返回 undefined，由调用方报错——
+ *  绝不静默落到 defaultProduct，否则信号说 SPCX 却把单子下到 BTC 上（下错标的）。 */
 export function productFor(cfg: LiveConfig, marketId?: string): LiveProductVM | undefined {
-  if (marketId) {
-    const p = (cfg.products ?? []).find((x) => x.marketId === marketId);
-    if (p) return p;
+  const want = String(marketId ?? "").trim();
+  if (!want) return cfg.defaultProduct;
+  const list = cfg.products ?? [];
+  const exact = list.find((x) => x.marketId === want);
+  if (exact) return exact;
+  // 兼容外部策略只给 symbol（SPCX-PERP / spcx-perp）或纯数字 productId 的情况
+  const lower = want.toLowerCase();
+  const bySymbol = list.find((x) => String(x.symbol ?? "").toLowerCase() === lower);
+  if (bySymbol) return bySymbol;
+  if (/^\d+$/.test(want)) {
+    const byId = list.find((x) => Number(x.productId) === Number(want));
+    if (byId) return byId;
   }
-  return cfg.defaultProduct;
+  // 形如 nado:perp:SPCX-PERP 之外的写法（例如 perp:SPCX-PERP）按尾部 symbol 兜底匹配
+  const tail = lower.includes(":") ? lower.slice(lower.lastIndexOf(":") + 1) : "";
+  if (tail) {
+    const byTail = list.find((x) => String(x.symbol ?? "").toLowerCase() === tail);
+    if (byTail) return byTail;
+  }
+  return undefined;
 }

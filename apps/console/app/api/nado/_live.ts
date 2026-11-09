@@ -48,6 +48,7 @@ const humanNum = (v: BigNumberish | string | number | undefined): number => (v =
 export interface LiveProduct {
   marketId: MarketId; productId: number; symbol: string; kind: "perp" | "spot";
   tickSize: Decimal; stepSize: Decimal; minSize: Decimal; minNotional: Decimal;
+  maxLeverage?: number; // 最大杠杆 = 1 / 初始保证金率（spot 或缺失时为 undefined）
 }
 
 // ---- KEYLESS public config (NO workspace unlock; markets via a public query) --------
@@ -81,6 +82,7 @@ async function buildPublicConfig(chainId: number): Promise<PublicConfig> {
     type: unknown; productId: number; symbol: string;
     priceIncrement: BigNumberish; sizeIncrement: BigNumberish; minSize: BigNumberish;
     makerFeeRate?: BigNumberish; takerFeeRate?: BigNumberish;
+    longWeightInitial?: BigNumberish; // 初始保证金率（x18/human 标量），用于反推最大杠杆
   }> };
   const markets: Market[] = [];
   const productIds: Record<MarketId, number> = {};
@@ -93,18 +95,25 @@ async function buildPublicConfig(chainId: number): Promise<PublicConfig> {
     // Correct unit interpretation: base min = one size increment; the `minSize` field is a
     // USDT0 NOTIONAL floor (not a base size). See adapter-nado/sizing.ts.
     const sizing = nadoMarketSizing(humanStr(s.priceIncrement), x18(s.sizeIncrement), x18(s.minSize));
+    // 最大杠杆 = 1 / 初始保证金率，而初始保证金率 = 1 − longWeightInitial（合约风险权重）。
+    // 实测权重与杠杆一一对应：0.98→50x、0.975→40x、0.95→20x、0.9→10x、0.8→5x、0.667→3x、0.5→2x。
+    // spot 没有杠杆概念，留空。
+    const weight = humanNum(s.longWeightInitial);
+    const maxLeverage = kind === "perp" && weight > 0 && weight < 1 ? Math.round(1 / (1 - weight)) : undefined;
     const prod: LiveProduct = {
       marketId, productId: Number(s.productId), symbol: s.symbol, kind,
       tickSize: sizing.tickSize as Decimal,
       stepSize: sizing.stepSize as Decimal,
       minSize: sizing.minSize as Decimal,
       minNotional: sizing.minNotional as Decimal,
+      maxLeverage,
     };
     markets.push({
       id: marketId, chainId: chainId as ChainId, product: kind, base, quote: "USDT0",
       tickSize: prod.tickSize, stepSize: prod.stepSize, minNotional: prod.minNotional,
       makerFeeBps: Math.round(humanNum(s.makerFeeRate) * 10000) as Bps,
       takerFeeBps: Math.round(humanNum(s.takerFeeRate) * 10000) as Bps,
+      maxLeverage,
       raw: s,
     });
     productIds[marketId] = prod.productId;

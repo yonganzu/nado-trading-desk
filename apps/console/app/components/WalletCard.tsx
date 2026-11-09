@@ -6,6 +6,7 @@ import { Badge, LayerCard, cn } from "@cloudflare/kumo";
 import type { BadgeVariant } from "@cloudflare/kumo";
 import type { WalletVM, WalletStatus } from "@farm/ui";
 import { AccountKindBadge } from "./AccountKindBadge";
+import { MAKER_ACCENT, MAKER_CHIP, TAKER_ACCENT, TAKER_CHIP } from "../lib/cohortColors";
 import type { WalletCheckState } from "../lib/walletCheck";
 import type { NadoOpenState } from "../lib/nadoOpen";
 
@@ -24,9 +25,13 @@ const CARD_STYLE: CSSProperties = { contentVisibility: "auto", containIntrinsicS
 // the grid is column-virtualized, so the waste was every MOUNTED stable (mock) card re-rendering
 // on each live setLive tick (the sweep reconciles ~2/s). A card now re-renders only when its
 // wallet VM, selected, or onSelect changes.
-export const WalletCard = memo(function WalletCard({ wallet, selected, onSelect, check, nado }: {
+export const WalletCard = memo(function WalletCard({ wallet, selected, picked, pickable, onSelect, check, nado }: {
   wallet: WalletVM;
   selected: boolean;
+  /** 右侧手动勾选（用于左侧自成交配对） */
+  picked?: boolean;
+  /** 是否给左上角的勾选框留出位置 */
+  pickable?: boolean;
   onSelect: (w: WalletVM) => void;
   /** 「检查 Nado 注册状态」的结果（未检查时为 undefined）。 */
   check?: WalletCheckState;
@@ -44,9 +49,13 @@ export const WalletCard = memo(function WalletCard({ wallet, selected, onSelect,
         "flex h-full w-full flex-col gap-2 p-3 text-left hover:bg-kumo-tint",
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand",
         selected && "ring-2 ring-kumo-brand",
+        picked && "bg-kumo-brand/5 ring-2 ring-kumo-brand",
+        // 分组标识色：挂单 = 黄、吃单 = 蓝（左侧竖条比徽标更容易在大列表里扫到）
+        wallet.cohort === "maker" && MAKER_ACCENT,
+        wallet.cohort === "taker" && TAKER_ACCENT,
       )}
     >
-      <div className="flex items-center justify-between gap-2">
+      <div className={cn("flex items-center justify-between gap-2", pickable && "pl-6")}>
         <AccountKindBadge kind={wallet.accountKind}>{wallet.accountName}</AccountKindBadge>
         <Badge variant={statusVariant}>{statusLabel}</Badge>
       </div>
@@ -62,7 +71,13 @@ export const WalletCard = memo(function WalletCard({ wallet, selected, onSelect,
         </div>
       </div>
       <div className="flex flex-wrap gap-1">
-        {wallet.cohorts.map((c) => <Badge key={c} variant="secondary">{c}</Badge>)}
+        {wallet.cohort === "maker" && (
+          <span className={cn("rounded border px-1.5 py-0.5 text-xs", MAKER_CHIP)}>挂单</span>
+        )}
+        {wallet.cohort === "taker" && (
+          <span className={cn("rounded border px-1.5 py-0.5 text-xs", TAKER_CHIP)}>吃单</span>
+        )}
+        {wallet.cohorts.filter((c) => c !== "maker" && c !== "taker").map((c) => <Badge key={c} variant="secondary">{c}</Badge>)}
         {check?.status === "registered" && <Badge variant="success">已注册</Badge>}
         {check?.status === "unregistered" && <Badge variant="warning">未注册</Badge>}
         {check?.status === "failed" && (

@@ -16,9 +16,25 @@ import type { WalletSigner, Hex, Eip712TypedData, Address } from "@farm/adapter-
 import type { Address as WativeEvmAddress } from "wative-core";
 
 export type AccountKind = "HD" | "PK";
+/** 自成交角色分组：一个钱包要么做 maker，要么做 taker（也可以不设置）。 */
+export type Cohort = "maker" | "taker";
 export interface CohortWallet {
   walletId: string; index: number; address: `0x${string}`; subaccountHex: string;
   accountSlug: string; accountName: string; accountKind: AccountKind;
+  tags: string[];          // 自由标签（持久化在 wative Wallet 的 tags 里）
+  cohort?: Cohort;         // maker/taker，占用保留标签（不出现在自由标签列表里）
+}
+
+// 自由标签和 maker/taker 角色都持久化在 wative 的 Wallet tags 里（存在 vault 中）。
+// 角色用一对互斥的保留标签，并且从 UI 展示的自由标签列表里剔除，让「标签」和「角色」两个概念分开。
+const COHORT_TAG = { maker: "cohort:maker", taker: "cohort:taker" } as const;
+function cohortOf(tags: readonly string[]): Cohort | undefined {
+  if (tags.includes(COHORT_TAG.maker)) return "maker";
+  if (tags.includes(COHORT_TAG.taker)) return "taker";
+  return undefined;
+}
+function freeformTags(tags: readonly string[]): string[] {
+  return tags.filter((t) => t !== COHORT_TAG.maker && t !== COHORT_TAG.taker);
 }
 export interface AccountVM { slug: string; name: string; kind: AccountKind; walletCount: number }
 export type VaultStatus = "absent" | "locked" | "unlocked";
@@ -39,6 +55,10 @@ interface BrowserWallet {
   evm: BrowserEvm | null;
   /** wative 的钱包私钥导出（仅在内存中返回明文，调用方负责不落盘）。 */
   dumpPrivateKey(vm: string): string;
+  // wative Wallet 的持久化标签接口（存在 vault 里）。展平时读取 tags，修改时调用下面两个方法。
+  readonly tags: readonly string[];
+  addTag(tag: string): Promise<void>;
+  removeTag(tag: string): Promise<void>;
 }
 interface BrowserAccount {
   readonly slug: string; displayName: string; readonly organizationType?: string;
@@ -82,6 +102,7 @@ let session: {
   accounts: SessionAccount[];
   wallets: CohortWallet[];
   evmByWalletId: Map<string, BrowserEvm>;
+  walletByWalletId: Map<string, BrowserWallet>; // walletId → wative Wallet（用于读写标签）
 } | null = null;
 
 async function provider(): Promise<unknown> {
@@ -103,24 +124,30 @@ async function rebuildFlat(): Promise<CohortWallet[]> {
   const { subaccountToHex } = await sdk();
   const wallets: CohortWallet[] = [];
   const evmByWalletId = new Map<string, BrowserEvm>();
+  const walletByWalletId = new Map<string, BrowserWallet>();
   let g = 0;
   for (const sa of session.accounts) {
     for (let j = 0; j < sa.acc.wallets.length; j++) {
-      const evm = sa.acc.wallets[j]?.evm;
-      if (!evm) continue;
+      const bw = sa.acc.wallets[j];
+      const evm = bw?.evm;
+      if (!bw || !evm) continue;
       const walletId = `live:${g}`;
       const address = evm.publicKey as `0x${string}`;
+      const allTags = bw.tags ?? [];
       wallets.push({
         walletId, index: g, address,
         subaccountHex: subaccountToHex({ subaccountOwner: address, subaccountName: "default" }),
         accountSlug: sa.slug, accountName: sa.name, accountKind: sa.kind,
+        tags: freeformTags(allTags), cohort: cohortOf(allTags),
       });
       evmByWalletId.set(walletId, evm);
+      walletByWalletId.set(walletId, bw);
       g++;
     }
   }
   session.wallets = wallets;
   session.evmByWalletId = evmByWalletId;
+  session.walletByWalletId = walletByWalletId;
   return wallets;
 }
 
@@ -133,7 +160,7 @@ async function loadSession(ws: BrowserWorkspace, password: string): Promise<void
     await acc.tryUnlock(password);
     accounts.push({ acc, slug: acc.slug, name: acc.displayName, kind: kindOf(acc) });
   }
-  session = { ws, accounts, wallets: [], evmByWalletId: new Map() };
+  session = { ws, accounts, wallets: [], evmByWalletId: new Map(), walletByWalletId: new Map() };
   await rebuildFlat();
 }
 
@@ -317,6 +344,41 @@ export async function importCohortByPrivateKeys(keys: string[], password: string
 
 export function isUnlocked(): boolean { return session !== null; }
 export function cohortWallets(): CohortWallet[] { return session?.wallets ?? []; }
+
+function walletHandle(walletId: string): BrowserWallet {
+  const bw = session?.walletByWalletId.get(walletId);
+  if (!bw) throw new Error(`no in-tab wallet ${walletId}`);
+  return bw;
+}
+
+/** 给钱包加一个自由标签（持久化在 wative Wallet tags 里）。拒绝保留的 cohort 标签，
+ *  让「标签」和「角色」两个概念保持分开。幂等；完成后重建扁平列表。 */
+export async function addWalletTag(walletId: string, tag: string): Promise<CohortWallet[]> {
+  const bw = walletHandle(walletId);
+  const clean = tag.trim();
+  if (!clean) throw new Error("empty tag");
+  if (clean === COHORT_TAG.maker || clean === COHORT_TAG.taker) throw new Error("reserved tag");
+  if (!bw.tags.includes(clean)) await bw.addTag(clean);
+  return rebuildFlat();
+}
+
+/** 移除钱包上的自由标签。幂等；完成后重建扁平列表。 */
+export async function removeWalletTag(walletId: string, tag: string): Promise<CohortWallet[]> {
+  const bw = walletHandle(walletId);
+  if (bw.tags.includes(tag)) await bw.removeTag(tag);
+  return rebuildFlat();
+}
+
+/** 设置钱包的 maker/taker 角色：一对互斥的保留标签（加上目标、去掉另一个）。
+ *  可以在这里手动切换，自成交引擎分配 cohort 时也调用它。完成后重建扁平列表。 */
+export async function setWalletCohort(walletId: string, cohort: Cohort): Promise<CohortWallet[]> {
+  const bw = walletHandle(walletId);
+  const want = COHORT_TAG[cohort];
+  const other = COHORT_TAG[cohort === "maker" ? "taker" : "maker"];
+  if (bw.tags.includes(other)) await bw.removeTag(other);
+  if (!bw.tags.includes(want)) await bw.addTag(want);
+  return rebuildFlat();
+}
 
 /** A seam WalletSigner backed by the in-tab wative EVM signer for a walletId. The key never
  *  leaves the browser; this only ever returns a signature over supplied data. */

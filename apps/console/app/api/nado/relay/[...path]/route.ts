@@ -57,7 +57,12 @@ export async function POST(req: Request, ctx: { params: Promise<{ path?: string[
         continue;
       }
       const text = await r.text();
-      return new NextResponse(text, { status: r.status, headers: { "content-type": "application/json" } });
+      // 把「这次请求一共打了几次 sequencer」回传给浏览器（1 = 没重试）。面板据此区分
+      // 「两腿间隔」里的尖峰到底是 relay 的 429 静默重试拖出来的，还是 sequencer 本身慢。
+      return new NextResponse(text, {
+        status: r.status,
+        headers: { "content-type": "application/json", "x-relay-attempts": String(attempt + 1) },
+      });
     }
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 502 });

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Banner, Button, ButtonGroup, LayerDialog } from "@cloudflare/kumo";
+import { Banner, Button, LayerDialog } from "@cloudflare/kumo";
 import { WarningIcon } from "@phosphor-icons/react";
 import { useNetwork } from "./NetworkProvider";
 import { NETWORKS } from "../lib/chainEnv";
@@ -9,15 +9,15 @@ import { NETWORKS } from "../lib/chainEnv";
 const TESTNET = 763373;
 const MAINNET = 57073;
 
-/** The 2-pole Testnet | Mainnet switch as Kumo's ButtonGroup of toggle Buttons. The active pole is
- *  variant="primary", which paints Kumo's brand — re-pointed per network in globals.css — so it always
- *  shows the current network's accent (Kumo's segmented Tabs would not: its active pill is neutral).
- *  Flipping to TESTNET is instant; MAINNET asks first in a Kumo LayerDialog.Alert whose confirm button
- *  carries data-net="mainnet", so it reads in the mainnet accent while the app is still on testnet.
- *  No env, no rebuild — the selection is a cookie the client + server both read; the switch is live. */
+/** 单按钮版网络切换：只显示「当前网络」，点一下就切到另一个网络（不再并排显示两网按钮）。
+ *  切到 TESTNET 立即生效；切回 MAINNET 仍然先弹确认框（真实资金，且确认按钮带主网配色）。
+ *  网络选择是客户端 + 服务端共读的 cookie，所以切换即时生效、不用重启。 */
 export function NetworkSwitch() {
   const { chainId, setChain } = useNetwork();
   const [confirm, setConfirm] = useState(false);
+
+  const current = NETWORKS[chainId]?.networkName ?? "";
+  const other = chainId === MAINNET ? TESTNET : MAINNET; // 点击后要切到的那一个
 
   const pick = (id: number) => {
     if (id === chainId) return;
@@ -28,23 +28,17 @@ export function NetworkSwitch() {
   return (
     <div className="flex flex-col gap-2">
       <span className="text-sm font-medium text-kumo-subtle">Network</span>
-      <ButtonGroup aria-label="Network" className="w-full">
-        {[TESTNET, MAINNET].map((id) => {
-          const active = chainId === id;
-          return (
-            <Button
-              key={id}
-              size="sm"
-              variant={active ? "primary" : "secondary"}
-              aria-pressed={active}
-              className="flex-1 capitalize"
-              onClick={() => pick(id)}
-            >
-              {NETWORKS[id]!.networkName}
-            </Button>
-          );
-        })}
-      </ButtonGroup>
+      {/* 只保留一个按钮：显示当前网络名，点击 = 切到另一个网络 */}
+      <Button
+        size="sm"
+        variant="primary"
+        title={`当前 ${current}，点击切换到 ${NETWORKS[other]?.networkName ?? ""}`}
+        aria-label={`网络：当前 ${current}，点击切换`}
+        className="w-full capitalize"
+        onClick={() => pick(other)}
+      >
+        {current}
+      </Button>
 
       <LayerDialog.Alert open={confirm} onOpenChange={setConfirm}>
         <LayerDialog.Content size="sm">

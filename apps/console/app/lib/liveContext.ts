@@ -15,13 +15,14 @@ import type { OnchainExecutor } from "@farm/core";
 import { NadoAdapter, createLiveNadoGateway, NADO_MANIFEST, buildWithdrawTypedData, clampOrderSize } from "@farm/adapter-nado";
 import type { TransportLike } from "@farm/adapter-nado";
 import { EngineClient } from "@nadohq/engine-client";
-import { getOrderNonce } from "@nadohq/client";
+import { getOrderNonce, getOrderVerifyingAddress, packOrderAppendix, TriggerClient } from "@nadohq/client";
 import type { SignerContext, PlaceOrderInput, Decimal, ChainId, Order, Position, Balance, MarketId, OrderBook } from "@farm/adapter-api";
 import type { Address as WativeAddress, ChainId as WativeChainId } from "wative-core";
 import { parseUnits, formatUnits, toHex, parseEther } from "viem";
 import { signerForWalletId, evmAddressForWalletId } from "./custody";
 import { getLiveConfig, productFor } from "./liveConfig";
 import type { LiveConfig, LiveProductVM } from "./liveConfig";
+import type { TriggerPriceType } from "./strategySignalModel";
 import { activeNetwork } from "./chainEnv";
 
 // Mutable per-operation chain config, mirrored from the SELECTED network. A live network switch
@@ -103,13 +104,35 @@ const limiter = new RateLimiter().register(NADO_MANIFEST.rateLimits);
 // on the relay's 429 retry. We also THROW on a non-2xx relay response (502 network error,
 // exhausted-429, …) so a failed write becomes a FAILED job, never a silent
 // {digest:"",status:"open"} success. (Reads meter directly in the gateway.)
+// 最近一次「写」请求的耗时/重试分解。relay 通过 x-relay-attempts 头回传尝试次数，
+// automation 用它把一条腿的时间拆成「等令牌 / relay 往返 / 本地组装+签名」三段，
+// 好判断 2–3.6s 的延迟到底是限流、网络还是本地。读请求走的是 EngineClient，不经过这条 transport。
+export interface WriteTiming {
+  waitMs: number;  // 等限速令牌的时间
+  relayMs: number; // relay → sequencer 的往返
+  attempts: number; // 打了 sequencer 几次（1 = 没重试）
+}
+let lastWriteTiming: WriteTiming = { waitMs: 0, relayMs: 0, attempts: 1 };
+/** 取走并归位最近一次写请求的计时：避免一次没重试的请求被上一次的值污染。 */
+export function takeWriteTiming(): WriteTiming {
+  const t = lastWriteTiming;
+  lastWriteTiming = { waitMs: 0, relayMs: 0, attempts: 1 };
+  return t;
+}
+
 const transport: TransportLike = {
   async request<T>(a: { method: "GET" | "POST"; url: string; body?: unknown; signal?: AbortSignal; bucket?: string; weight?: number; key?: string }): Promise<T> {
+    const t0 = Date.now();
     if (a.bucket) await limiter.acquire(a.bucket, a.weight ?? 1, a.key, a.signal);
+    lastWriteTiming.waitMs = Date.now() - t0;
+    const t1 = Date.now();
     const r = await fetch(a.url, {
       method: a.method, headers: { "content-type": "application/json" },
       body: a.body != null ? JSON.stringify(a.body) : undefined, signal: a.signal,
     });
+    lastWriteTiming.relayMs = Date.now() - t1;
+    // relay 重试次数先记下来，再判断成败：失败那次也能看出是被限速拖慢的
+    lastWriteTiming.attempts = Number(r.headers.get("x-relay-attempts") ?? "") || 1;
     if (!r.ok) {
       const detail = await r.text().catch(() => "");
       throw new Error(`relay ${r.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`);
@@ -178,7 +201,7 @@ async function liveFor(walletId: string): Promise<{ live: Live; cfg: LiveConfig 
 }
 
 /** Drop a wallet's cached context (call after a re-import / lock). */
-export function resetLiveContexts(): void { cache.clear(); }
+export function resetLiveContexts(): void { cache.clear(); triggerCache.clear(); }
 
 // Session idempotency (client-side): jobId → the order it produced, so a kill/resume
 // re-queue (or a double-send) returns the prior order instead of firing a new one.
@@ -211,7 +234,17 @@ async function marketPrice(engine: EngineClient, productId: number): Promise<{ b
   return { bid: num(mp.bid), ask: num(mp.ask) };
 }
 
-export interface PlaceOpts { side: "buy" | "sell"; size?: string | number; price?: string | number; taker?: boolean; reduceOnly?: boolean; jobId?: string; signal?: AbortSignal }
+export interface PlaceOpts { side: "buy" | "sell"; size?: string | number; price?: string | number; taker?: boolean; postOnly?: boolean; reduceOnly?: boolean; jobId?: string; signal?: AbortSignal }
+
+/** 解析信号里的品种写法（marketId / symbol / 纯数字 productId）并返回品种。
+ *  查不到直接抛错，绝不回退默认品种——否则信号说 SPCX 却把单子下到 BTC 上。
+ *  策略桥先用它把 market 归一成 marketId，再把同一结果回显到信号回执里。 */
+export async function resolveProductLive(marketId?: string): Promise<LiveProductVM> {
+  const cfg = await getLiveConfig();
+  const product = productFor(cfg, marketId);
+  if (!product) throw new Error(`未知品种 ${marketId ?? ""}：控制台的 products 里没有匹配的 marketId/symbol`);
+  return product;
+}
 
 /** Place an order IN-TAB: sign client-side → submit through the keyless relay. The
  *  OPERATOR's price wins (tick-aligned); a taker crosses; only with no operator price
@@ -220,7 +253,7 @@ export async function placeOrderLive(walletId: string, marketId: string | undefi
   if (opts.signal?.aborted) throw new Error("aborted");
   const { live, cfg } = await liveFor(walletId);
   const product = productFor(cfg, marketId);
-  if (!product) throw new Error("no live product");
+  if (!product) throw new Error(`未知品种 ${marketId ?? ""}：控制台的 products 里没有匹配的 marketId/symbol`);
   const taker = opts.taker === true;
   const idemKey = opts.jobId ? `${walletId}:${opts.jobId}` : undefined;
   if (idemKey && submitted.has(idemKey)) return submitted.get(idemKey)!;
@@ -264,10 +297,13 @@ export async function placeOrderLive(walletId: string, marketId: string | undefi
     throw new Error(`order notional ${notionalUsdt0} USDT0 exceeds cap ${MAX_ORDER_NOTIONAL_USDT0} (NEXT_PUBLIC_NADO_MAX_ORDER_NOTIONAL_USDT0)`);
   }
   if (opts.signal?.aborted) throw new Error("aborted");
+  // postOnly 缺省沿用旧行为：吃单(false) / 挂单(true)。显式 postOnly:false + 不 taker
+  // = 普通 GTC 限价单（可挂可吃），策略桥用它把"确认追单"也发成 GTC。
+  const postOnly = opts.postOnly ?? !taker;
   const input: PlaceOrderInput = {
     market: product.marketId as MarketId, side: opts.side, kind: "limit",
     size: built.size as Decimal, price: built.price as Decimal,
-    postOnly: !taker, tif: taker ? "ioc" : undefined, reduceOnly: built.reduceOnly,
+    postOnly, tif: taker ? "ioc" : undefined, reduceOnly: built.reduceOnly,
     clientId: opts.jobId ?? `tab:${walletId}:${Date.now()}`,
     // Stabilize the digest only for jobId'd (retryable) orders; manual fires keep a fresh nonce.
     hints: idemKey ? { nonce: built.nonce, expiration: built.expiration } : undefined,
@@ -292,12 +328,168 @@ export async function cancelLive(walletId: string, marketId: string | undefined,
   return live.adapter.trading.cancelOrders(live.ctx, { market: marketId as MarketId | undefined, venueIds });
 }
 
+// =============================================================================
+// Nado 条件单（trigger service）
+//
+// Nado 网关本身只有 limit（default / ioc / post_only）+ reduceOnly，兜底止损挂在
+// 盘口外侧天然是穿价方向：post-only 会被 sequencer 拒（2008），普通 GTC 会立刻
+// 按市价把仓位吃掉。所以止损必须做成条件单——价格触发后由 trigger 服务把一张
+// IOC(reduceOnly) 单送进 sequencer，ASH 掉线时交易所侧也能止损。
+//
+// 签名仍在标签页内完成，签名后的字节经 /api/nado/trigger 的无金钥中继转发。
+// =============================================================================
+const TRIGGER_RELAY = "/api/nado/trigger";
+
+export interface TriggerOrderOpts {
+  side: "buy" | "sell";
+  /** 基础币数量，人类小数 */
+  size: string | number;
+  /** 触发后提交给撮合的限价；止损场景要故意穿过盘口，配合 IOC 才能成交 */
+  price: string | number;
+  /** 触发条件类型（多单止损用 last_price_below，空单用 last_price_above） */
+  triggerType: TriggerPriceType;
+  /** 触发价，人类小数 */
+  triggerPrice: string | number;
+  reduceOnly?: boolean;
+  signal?: AbortSignal;
+}
+
+export interface TriggerOrderResult {
+  /** trigger 服务的条件单 digest（撤条件单必须用它，条件单不在常规挂单列表里） */
+  digest?: string;
+  status: string;
+  price: string;
+  size: string;
+  triggerPrice: string;
+  /** 实际下单的品种（回显用）：信号里的 market 可能写成 symbol，这里给出解析结果 */
+  marketId: string;
+  productId: number;
+}
+
+// 每个 (walletId, owner) 一个 TriggerClient，内部复用 axios 实例
+const triggerCache = new Map<string, TriggerClient>();
+
+/** 取（或懒建）钱包对应的 trigger 客户端：签名器接到标签页内的 wative signer。 */
+async function triggerFor(walletId: string): Promise<{ client: TriggerClient; cfg: LiveConfig; owner: string }> {
+  const { live, cfg } = await liveFor(walletId);
+  if (!cfg.endpoint) throw new Error("no live endpoint configured");
+  const signer = live.ctx.signer;
+  const owner = signer.address.value;
+  const key = `${walletId}:${owner}`;
+  let client = triggerCache.get(key);
+  if (!client) {
+    // TriggerClient 只需要一个鸭子类型的 signTypedData(td)；私钥不出浏览器，
+    // 与 placeOrderLive 走同一条 in-tab 签名链路。
+    const walletClient = {
+      signTypedData: (td: unknown) => {
+        if (!signer.signTypedData) throw new Error("signer has no signTypedData (EVM only)");
+        return signer.signTypedData(td as never, CHAIN);
+      },
+    };
+    client = new TriggerClient({ url: TRIGGER_RELAY, walletClient: walletClient as never });
+    triggerCache.set(key, client);
+  }
+  return { client, cfg, owner };
+}
+
+/** 挂一张条件单 IN-TAB：标签页内签名 → 经中继提交到 trigger 服务。
+ *  触发后按 IOC 送入撮合，减少止损时的滑点；reduceOnly 保证不会反向开仓。 */
+export async function placeTriggerOrderLive(
+  walletId: string,
+  marketId: string | undefined,
+  opts: TriggerOrderOpts,
+): Promise<TriggerOrderResult> {
+  if (opts.signal?.aborted) throw new Error("aborted");
+  const { client, cfg, owner } = await triggerFor(walletId);
+  const product = productFor(cfg, marketId);
+  if (!product) throw new Error(`未知品种 ${marketId ?? ""}：控制台的 products 里没有匹配的 marketId/symbol`);
+  const price = alignDown(String(opts.price), product.tickSize);
+  const triggerPrice = alignDown(String(opts.triggerPrice), product.tickSize);
+  const size = clampSize(product, opts.size, price);
+  const notionalUsdt0 = Number(price) * Number(size);
+  if (notionalUsdt0 > MAX_ORDER_NOTIONAL_USDT0) {
+    throw new Error(`trigger order notional ${notionalUsdt0} USDT0 exceeds cap ${MAX_ORDER_NOTIONAL_USDT0} (NEXT_PUBLIC_NADO_MAX_ORDER_NOTIONAL_USDT0)`);
+  }
+  // amount 是 X18 有符号整数（buy 正 / sell 负）；price 保持人类小数由 SDK 缩放
+  const amount = parseUnits(size, 18);
+  const signed = opts.side === "buy" ? amount : -amount;
+  const params = {
+    productId: product.productId,
+    order: {
+      subaccountOwner: owner,
+      subaccountName: SUBACCT,
+      amount: signed.toString(),
+      price,
+      expiration: String(Math.floor(Date.now() / 1000) + ORDER_TTL_SECS),
+      // appendix 标记这是「价格条件单」；触发后按 IOC 送撮合
+      appendix: packOrderAppendix({
+        orderExecutionType: "ioc",
+        reduceOnly: opts.reduceOnly ?? false,
+        triggerType: "price",
+      }).toString(),
+    },
+    triggerCriteria: { type: "price", criteria: { type: opts.triggerType, triggerPrice } },
+    // place_order 的 EIP-712 domain 用的是按 product 推导出来的 verifying address
+    verifyingAddr: getOrderVerifyingAddress(product.productId),
+    chainId: CHAIN,
+  };
+  const res = await client.placeTriggerOrder(params as never);
+  const data = res.data as { digest?: string; error?: string | null } | null;
+  if (data?.error) throw new Error(data.error);
+  return { digest: data?.digest, status: "waiting_price", price, size, triggerPrice, marketId: product.marketId, productId: product.productId };
+}
+
+/** 撤条件单 IN-TAB：条件单不在常规挂单列表里，只能按 digest 撤。
+ *  已触发/已撤销的 digest 会由服务端忽略，调用方按幂等处理。 */
+export async function cancelTriggerOrderLive(
+  walletId: string,
+  marketId: string | undefined,
+  digests: string[],
+  signal?: AbortSignal,
+): Promise<{ cancelled: number }> {
+  if (signal?.aborted) throw new Error("aborted");
+  const list = digests.filter((d) => /^0x[0-9a-fA-F]{64}$/.test(d));
+  if (list.length === 0) return { cancelled: 0 };
+  const { client, cfg, owner } = await triggerFor(walletId);
+  const product = productFor(cfg, marketId);
+  if (!product) throw new Error(`未知品种 ${marketId ?? ""}：控制台的 products 里没有匹配的 marketId/symbol`);
+  // cancel_orders 的 domain 用 endpoint 地址（与常规撤单一致）
+  const res = await client.cancelTriggerOrders({
+    digests: list,
+    productIds: [product.productId],
+    subaccountOwner: owner,
+    subaccountName: SUBACCT,
+    verifyingAddr: cfg.endpoint!,
+    chainId: CHAIN,
+  });
+  const data = res.data as { cancelled_orders?: unknown[] } | null;
+  return { cancelled: data?.cancelled_orders?.length ?? 0 };
+}
+
+/** 把一个钱包在**所有市场**上的仓位一次性平掉：只读一次持仓，然后对每个非零仓位发 reduce-only 的
+ *  穿价 IOC（等同市价全平，且不会反手开仓）。用于「开跑前 / 循环结束后」的兜底清扫。
+ *  返回实际发出平仓单的数量。 */
+export async function closeAllPositionsLive(walletId: string, signal?: AbortSignal): Promise<number> {
+  if (signal?.aborted) throw new Error("aborted");
+  const { live } = await liveFor(walletId);
+  const positions = await live.adapter.trading.getPositions(live.ctx.account);
+  let sent = 0;
+  for (const pos of positions) {
+    const size = Math.abs(Number(pos.size));
+    if (!(size > 0)) continue;
+    const side: "buy" | "sell" = pos.side === "short" ? "buy" : "sell";
+    await placeOrderLive(walletId, pos.market, { side, size, taker: true, reduceOnly: true });
+    sent++;
+  }
+  return sent;
+}
+
 /** Flatten the wallet's position on a market with an opposite crossing IOC, IN-TAB. */
 export async function closePositionLive(walletId: string, marketId: string | undefined, signal?: AbortSignal): Promise<{ closed: number; order?: Order; side?: "buy" | "sell" }> {
   if (signal?.aborted) throw new Error("aborted");
   const { live, cfg } = await liveFor(walletId);
   const product = productFor(cfg, marketId);
-  if (!product) throw new Error("no live product");
+  if (!product) throw new Error(`未知品种 ${marketId ?? ""}：控制台的 products 里没有匹配的 marketId/symbol`);
   const positions = await live.adapter.trading.getPositions(live.ctx.account);
   const pos = positions.find((p) => p.market === product.marketId);
   const amt = pos ? Number(pos.size) * (pos.side === "short" ? -1 : 1) : 0;
@@ -411,6 +603,38 @@ export async function readWalletLive(walletId: string): Promise<WalletReads> {
   ]);
   const native = readNative(walletId); // non-blocking: cache read + background refresh on miss
   return { openOrders, balances, positions, native };
+}
+
+/** 只读余额：省掉 getOpenOrders 的那一次计价读（每钱包从 2 令牌降到 1 令牌），
+ *  用于「选中钱包组后立刻显示余额」这种只看余额的场景。原生 gas 仍走缓存（SWR），不阻塞。 */
+export async function readWalletBalances(walletId: string): Promise<WalletReads> {
+  const { live } = await liveFor(walletId);
+  const balances = await live.adapter.getBalances(live.ctx.account).catch(() => undefined);
+  return { balances, native: readNative(walletId) };
+}
+
+// 「按需批量读余额」的优先级标记：期间页面的后台轮询让位——既不再抢同一个 2 次/秒的预算，
+// 也避免同一批钱包被读两遍。计数式，支持并发请求重叠。
+let priorityDepth = 0;
+export function beginPriorityReads(): void { priorityDepth++; }
+export function endPriorityReads(): void { priorityDepth = Math.max(0, priorityDepth - 1); }
+export function priorityReadsActive(): boolean { return priorityDepth > 0; }
+
+/** 市场的盘口最优价 + 最小变动价：从深度 1 的订单簿读 best bid/ask（人类可读小数），
+ *  再加上产品的 tickSize（同时给数字和原始字符串，方便调用方直接按 tick 网格定价、
+ *  避免浮点误差）。和 readOrderBookLive 一样无需指定密钥（任何已解锁钱包的上下文都能读到同一份盘口）。
+ *  市场没有对应产品时返回 undefined；临时读盘口失败会让 bid/ask 为 0，
+ *  自成交引擎会把这种对子当成「跳过」而不是「报错」。 */
+export async function marketTouchLive(walletId: string, marketId: string): Promise<{ bid: number; ask: number; tick: number; tickStr: string; failed?: boolean } | undefined> {
+  const { live, cfg } = await liveFor(walletId);
+  const product = productFor(cfg, marketId);
+  if (!product) return undefined;
+  let book: OrderBook | undefined;
+  let failed = false;
+  // 读失败（限速 429 / 网络抖动）和「盘口真的没单」是两件事，用 failed 标记区分，
+  // 否则引擎会把限速失败误判成空盘口跳过。
+  try { book = await live.adapter.trading.getOrderBook(marketId as MarketId, 1); } catch { failed = true; }
+  return { bid: Number(book?.bids?.[0]?.price ?? 0), ask: Number(book?.asks?.[0]?.price ?? 0), tick: Number(product.tickSize), tickStr: product.tickSize, failed };
 }
 
 /** Read a market's order book via the relay (getMarketLiquidity). The query itself is keyless (the

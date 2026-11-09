@@ -12,7 +12,7 @@ import type { Address, Order, Balance, Position, Market, Decimal } from "@farm/a
 import { getLiveConfig } from "./liveConfig";
 import type { LiveProductVM } from "./liveConfig";
 import { cohortWallets, listAccounts } from "./custody";
-import { readWalletLive } from "./liveContext";
+import { readWalletLive, readWalletBalances } from "./liveContext";
 
 export const LIVE_COHORT = "LIVE";
 export type { LiveProductVM };
@@ -22,6 +22,7 @@ export type { LiveProductVM };
 export interface LiveWallet {
   walletId: string; address: string; subaccount?: string;
   accountSlug: string; accountName: string; accountKind: AccountKind;
+  cohort?: "maker" | "taker";   // 自成交角色（来自标签页内的 vault）
   openOrders?: Order[]; balances?: Balance[]; positions?: Position[]; native?: Decimal;
 }
 
@@ -36,6 +37,7 @@ export interface LiveState {
   wsSubscribeUrl?: string;
   defaultProduct?: LiveProductVM;
   markets?: Market[];
+  products?: LiveProductVM[];   // product_id → marketId 映射（Accounting 账本用）
   wallets?: LiveWallet[];       // the in-tab cohort (client source of truth)
   accounts?: AccountVM[];       // the real vault accounts (home sidebar filter dimension)
   locked?: boolean;             // live is enabled but the in-tab cohort is not unlocked yet
@@ -61,12 +63,13 @@ export async function fetchLiveState(): Promise<LiveState> {
   const wallets: LiveWallet[] = coh.map((c) => ({
     walletId: c.walletId, address: c.address, subaccount: c.subaccountHex,
     accountSlug: c.accountSlug, accountName: c.accountName, accountKind: c.accountKind,
+    cohort: c.cohort,
   }));
   // The real vault accounts drive the home sidebar's Account filter (one entry per account).
   const accounts: AccountVM[] = listAccounts().map((a) => ({ id: a.slug, name: a.name, kind: a.kind, walletCount: a.walletCount }));
   return {
     enabled: true, chainId: cfg.chainId, endpoint: cfg.endpoint, wsSubscribeUrl: cfg.wsSubscribeUrl,
-    defaultProduct: cfg.defaultProduct, markets: cfg.markets, wallets, accounts,
+    defaultProduct: cfg.defaultProduct, markets: cfg.markets, products: cfg.products, wallets, accounts,
     locked: coh.length === 0, error: cfg.error,
   };
 }
@@ -77,6 +80,13 @@ export async function fetchLiveState(): Promise<LiveState> {
 export async function reconcileWallet(walletId: string): Promise<{ walletId: string; openOrders?: Order[]; balances?: Balance[]; positions?: Position[]; native?: Decimal }> {
   const reads = await readWalletLive(walletId);
   return { walletId, ...reads };
+}
+
+/** 只刷新余额（选中钱包组后快速显示余额用）：1 次 summary 读，不读挂单，
+ *  每钱包的计价读从 2 次降到 1 次。挂单/持仓那部分留给后台轮询按原节奏补齐。 */
+export async function reconcileBalances(walletId: string): Promise<{ walletId: string; balances?: Balance[]; native?: Decimal }> {
+  const { balances, native } = await readWalletBalances(walletId);
+  return { walletId, balances, native };
 }
 
 /** Merge a single reconciled wallet back into the live state (identity preserved, others untouched). */
@@ -107,7 +117,7 @@ export function liveWalletVMs(state: LiveState): WalletVM[] {
     });
     return {
       id: w.walletId, accountId: w.accountSlug, accountName: w.accountName, accountKind: w.accountKind,
-      index: i, address, cohorts: [LIVE_COHORT],
+      index: i, address, cohorts: [LIVE_COHORT], cohort: w.cohort,
       nativeBalance: w.native ?? "—", quoteBalance: quote?.total ?? "—",
       status: "active", readiness, openOrders: w.openOrders?.length ?? 0,
     };

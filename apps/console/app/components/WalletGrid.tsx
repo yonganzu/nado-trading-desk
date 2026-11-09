@@ -2,24 +2,28 @@
 
 import { useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowSquareOutIcon, CircleNotchIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
+import { cn } from "@cloudflare/kumo";
+import { ArrowSquareOutIcon, CheckIcon, CircleNotchIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
 import type { WalletVM } from "@farm/ui";
 import { WalletCard } from "./WalletCard";
 import type { WalletCheckState } from "../lib/walletCheck";
 import type { NadoOpenState } from "../lib/nadoOpen";
 
-// The horizontal card wall: rows fill the viewport height, columns extend rightward.
-// Virtualized by COLUMN — only the visible columns (+overscan) mount, so ~1000 cards
-// scroll smoothly. One wallet = one card.
+// 纵向卡片墙：一行铺满容器宽度，行数向下延伸，纵向滚动。
+// 按「行」虚拟化 —— 只有可见的几行（含 overscan）会挂载，1000 张卡片也能流畅滚动。
 const CARD_H = 168;
 const CARD_W = 230;
 const GAP = 12;
 const PAD = 16;
 
-export function WalletGrid({ wallets, selectedId, onSelect, checks, onCheck, nado, onOpenNado }: {
+export function WalletGrid({ wallets, selectedId, onSelect, pickedIds, onTogglePick, checks, onCheck, nado, onOpenNado }: {
   wallets: WalletVM[];
   selectedId?: string;
   onSelect: (w: WalletVM) => void;
+  /** 右侧手动勾选的钱包 id 集合（用于左侧自成交配对）；不传则不显示勾选框 */
+  pickedIds?: Set<string>;
+  /** 点击卡片左上角勾选框时触发；shift 为 true 表示按住 Shift 连选 */
+  onTogglePick?: (w: WalletVM, shift: boolean) => void;
   /** 每个钱包的「Nado 注册状态」检查结果，按 wallet.id 索引。 */
   checks?: Record<string, WalletCheckState>;
   /** 点击卡片右上角的检查按钮时触发。 */
@@ -30,14 +34,15 @@ export function WalletGrid({ wallets, selectedId, onSelect, checks, onCheck, nad
   onOpenNado?: (w: WalletVM) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [rows, setRows] = useState(4);
+  const [cols, setCols] = useState(1);
 
+  // 根据容器宽度算每行能放几张卡片（窗口/侧栏宽度变化时自动重算）
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const measure = () => {
-      const h = el.clientHeight - 2 * PAD;
-      setRows(Math.max(1, Math.floor((h + GAP) / (CARD_H + GAP))));
+      const w = el.clientWidth - 2 * PAD;
+      setCols(Math.max(1, Math.floor((w + GAP) / (CARD_W + GAP))));
     };
     measure();
     const ro = new ResizeObserver(measure);
@@ -45,34 +50,51 @@ export function WalletGrid({ wallets, selectedId, onSelect, checks, onCheck, nad
     return () => ro.disconnect();
   }, []);
 
-  const columns = Math.max(1, Math.ceil(wallets.length / rows));
-  const colVirtualizer = useVirtualizer({
-    horizontal: true,
-    count: columns,
+  const rowCount = Math.max(1, Math.ceil(wallets.length / cols));
+  const rowVirtualizer = useVirtualizer({
+    count: rowCount,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => CARD_W + GAP,
+    estimateSize: () => CARD_H + GAP,
     overscan: 3,
   });
 
   return (
-    <div ref={scrollRef} className="h-full overflow-x-auto overflow-y-hidden" style={{ padding: PAD }}>
-      <div style={{ width: colVirtualizer.getTotalSize(), height: "100%", position: "relative" }}>
-        {colVirtualizer.getVirtualItems().map((col) => {
-          const start = col.index * rows;
-          const slice = wallets.slice(start, start + rows);
+    <div ref={scrollRef} className="h-full overflow-x-hidden overflow-y-auto" style={{ padding: PAD }}>
+      <div style={{ height: rowVirtualizer.getTotalSize(), width: "100%", position: "relative" }}>
+        {rowVirtualizer.getVirtualItems().map((row) => {
+          const start = row.index * cols;
+          const slice = wallets.slice(start, start + cols);
           return (
             <div
-              key={col.key}
-              style={{ position: "absolute", top: 0, left: col.start, width: CARD_W, height: "100%", display: "flex", flexDirection: "column", gap: GAP }}
+              key={row.key}
+              style={{ position: "absolute", top: row.start, left: 0, right: 0, height: CARD_H, display: "flex", gap: GAP }}
             >
               {slice.map((w) => {
                 const check = checks?.[w.id];
                 const running = check?.status === "running";
                 const nadoState = nado?.[w.id];
                 const opening = nadoState?.status === "opening";
+                const picked = pickedIds?.has(w.id) ?? false;
                 return (
-                  <div key={w.id} style={{ height: CARD_H, flex: "0 0 auto", position: "relative" }}>
-                    <WalletCard wallet={w} selected={w.id === selectedId} onSelect={onSelect} check={check} nado={nadoState} />
+                  <div key={w.id} style={{ width: CARD_W, height: CARD_H, flex: "0 0 auto", position: "relative" }}>
+                    <WalletCard wallet={w} selected={w.id === selectedId} picked={picked} pickable={!!onTogglePick} onSelect={onSelect} check={check} nado={nadoState} />
+                    {/* 勾选框：与卡片按钮是兄弟节点（不能嵌套 button），放在卡片左上角 */}
+                    {onTogglePick && (
+                      <button
+                        type="button"
+                        data-testid="wallet-pick"
+                        aria-pressed={picked}
+                        aria-label={picked ? `取消选择 #${w.index}` : `选择 #${w.index} 参与自成交配对`}
+                        title="勾选参与自成交配对（Shift 点选可连续选中）"
+                        onClick={(e) => { onTogglePick(w, e.shiftKey); }}
+                        className={cn(
+                          "absolute left-2.5 top-2.5 z-10 grid size-5 place-items-center rounded border text-kumo-default",
+                          picked ? "border-kumo-brand bg-kumo-brand/15" : "border-kumo-line bg-kumo-base hover:bg-kumo-tint",
+                        )}
+                      >
+                        {picked && <CheckIcon size={12} weight="bold" />}
+                      </button>
+                    )}
                     {/* 操作按钮与卡片按钮是兄弟节点（不能嵌套 button），定位在地址行右侧的空白处 */}
                     <div className="absolute right-2 top-9 flex items-center gap-0.5">
                       <button
@@ -91,8 +113,8 @@ export function WalletGrid({ wallets, selectedId, onSelect, checks, onCheck, nad
                       <button
                         type="button"
                         data-testid="wallet-check"
-                        title={running ? "正在检查 Nado 注册状态" : "检查 Nado 注册状态"}
-                        aria-label={`检查 #${w.index} 的 Nado 注册状态`}
+                        title={running ? "正在检查 Nado 注册状态与余额" : "检查 Nado 注册状态（同时刷新余额）"}
+                        aria-label={`检查 #${w.index} 的 Nado 注册状态并刷新余额`}
                         disabled={running}
                         onClick={() => onCheck?.(w)}
                         className="grid size-5 place-items-center rounded text-kumo-subtle hover:bg-kumo-tint hover:text-kumo-default disabled:cursor-wait disabled:opacity-60"

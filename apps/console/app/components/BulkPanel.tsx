@@ -41,7 +41,7 @@ function JitterField({ label, value, setValue, jitter, setJitter, max, setMax }:
   );
 }
 
-export function BulkPanel({ wallets, liveMarkets }: { wallets: WalletVM[]; liveMarkets?: Market[] }) {
+export function BulkPanel({ wallets, liveMarkets, embedded = false }: { wallets: WalletVM[]; liveMarkets?: Market[]; embedded?: boolean }) {
   const { net } = useNetwork(); // live network name for the confirm copy (no hardcoded "testnet")
   const list = wallets ?? [];
   // When every target is the LIVE wallet, drive the market picker from the live
@@ -151,13 +151,10 @@ export function BulkPanel({ wallets, liveMarkets }: { wallets: WalletVM[]; liveM
   const runsCap = Math.max(1, Number(maxRuns) || 1);
   const em = (v: React.ReactNode) => <strong className="font-medium text-kumo-default">{v}</strong>;
 
-  return (
+  // 控件本体单独抽出来：嵌在「文件夹标签卡」里时（embedded）不再画自己的外框，
+  // 独立使用时仍然包一层 LayerCard，外观和行为都不变。
+  const controls = (
     <>
-      {/* shrink-0: an overflow-hidden flex item in the fixed-height sidebar would otherwise shrink and
-          clip its own controls instead of letting the sidebar scroll. */}
-      <LayerCard className="shrink-0">
-        <LayerCard.Secondary>Bulk action</LayerCard.Secondary>
-        <LayerCard.Primary className="flex flex-col gap-3">
           {allLive && (
             <Select
               size="sm"
@@ -260,8 +257,21 @@ export function BulkPanel({ wallets, liveMarkets }: { wallets: WalletVM[]; liveM
               </div>
             </div>
           )}
-        </LayerCard.Primary>
-      </LayerCard>
+    </>
+  );
+
+  return (
+    <>
+      {/* shrink-0: an overflow-hidden flex item in the fixed-height sidebar would otherwise shrink and
+          clip its own controls instead of letting the sidebar scroll. */}
+      {embedded ? (
+        <div className="flex flex-col gap-3">{controls}</div>
+      ) : (
+        <LayerCard className="shrink-0">
+          <LayerCard.Secondary>Bulk action</LayerCard.Secondary>
+          <LayerCard.Primary className="flex flex-col gap-3">{controls}</LayerCard.Primary>
+        </LayerCard>
+      )}
 
       <ConfirmDialog
         open={confirmOpen}

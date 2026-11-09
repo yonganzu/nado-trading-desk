@@ -1,19 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Empty, Input, LinkButton, Sidebar as KumoSidebar, Text, Tooltip } from "@cloudflare/kumo";
-import { ArrowRightIcon, FunnelIcon, ReceiptIcon, SignInIcon, UsersThreeIcon, WalletIcon } from "@phosphor-icons/react";
+import { FunnelIcon, ReceiptIcon, UsersThreeIcon, WalletIcon } from "@phosphor-icons/react";
 import { filterWallets, accountOptions, cohortsOf } from "@farm/ui";
 import type { WalletVM, Fleet } from "@farm/ui";
 import { Sidebar } from "./components/Sidebar";
 import { WalletGrid } from "./components/WalletGrid";
 import { WalletDrawer } from "./components/WalletDrawer";
 import { CohortFilmstrip } from "./components/CohortFilmstrip";
+import { CohortPairBoard } from "./components/CohortPairBoard";
 import { AccountingView } from "./components/AccountingView";
 import { useNetwork } from "./components/NetworkProvider";
-import { bulk } from "./lib/bulk";
-import { fetchLiveState, reconcileWallet, mergeWallet, liveWalletVMs, isLiveWallet } from "./lib/live";
-import { readBudget, forceRefreshNative, TREASURY_WALLET_ID } from "./lib/liveContext";
+import { fetchLiveState, reconcileWallet, reconcileBalances, mergeWallet, liveWalletVMs, isLiveWallet } from "./lib/live";
+import { readBudget, forceRefreshNative, TREASURY_WALLET_ID, beginPriorityReads, endPriorityReads, priorityReadsActive } from "./lib/liveContext";
+import { readPrefJson, writePrefJson } from "./lib/prefs";
 import { openOrderUpdateStream } from "./lib/orderUpdateStream";
 import { checkWalletRegistration, loadStoredChecks, readStoredCheck } from "./lib/walletCheck";
 import type { WalletCheckState } from "./lib/walletCheck";
@@ -23,17 +24,95 @@ import { applyStoredStates } from "./lib/nadoRegistryModel";
 import type { LiveState } from "./lib/live";
 import { openLiveStream } from "./lib/liveStream";
 import type { LiveEvent } from "./lib/liveStream";
+import { accountingLedger } from "./lib/accountingLedger";
 
 export default function Page() {
   const { chainId, net } = useNetwork(); // selected network: drives labels + the reconnect-on-switch
   // The fleet is the REAL in-tab cohort only (no mock): the home page shows the unlocked vault's
   // accounts and their wallets, grouped by account in the sidebar filter.
   const [live, setLive] = useState<LiveState>({ enabled: false });
+  // 左侧栏是否展开：收起后只留一条窄边和展开按钮，把横向空间让给主区域
+  const [railOpen, setRailOpen] = useState(true);
+  // 左侧栏宽度（px）：可以拖右边框调整，最大到画面宽度的 2/3，最小 220px
+  const [railWidth, setRailWidth] = useState(320);
+  const RAIL_MIN_WIDTH = 220;
+  const railMaxWidth = () => (typeof window === "undefined" ? 1200 : Math.round(window.innerWidth * 2 / 3));
+  const railDragRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const onRailResizeStart = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    railDragRef.current = { startX: e.clientX, startWidth: railWidth };
+    const onMove = (ev: PointerEvent) => {
+      const drag = railDragRef.current;
+      if (!drag) return;
+      const next = Math.min(Math.max(RAIL_MIN_WIDTH, drag.startWidth + (ev.clientX - drag.startX)), railMaxWidth());
+      setRailWidth(next);
+    };
+    const onUp = () => {
+      railDragRef.current = null;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+  // 右侧手动勾选的钱包（左侧 Trading strategy 用它做组内两两配对，一个 maker 一个 taker）
+  const [picked, setPicked] = useState<Set<string>>(() => new Set());
+  const pickAnchor = useRef<string | null>(null); // Shift 连选的起点（上一个点选的钱包）
   // Repopulate the live fleet IDENTITIES (keyless config + in-tab cohort; no per-wallet reads).
   // Called on mount and on cohort change (unlock/lock/import); the budget-paced sweep + the
   // WS-targeted reconcile fill in each wallet's reads afterward.
   const refreshLive = useCallback(() => { fetchLiveState().then(setLive).catch(() => {}); }, []);
   useEffect(() => { refreshLive(); }, [refreshLive, chainId]); // re-fetch + reconnect on a network switch
+
+  // 按需读取一组钱包的余额（交易面板选中钱包组时触发）：逐个「只读余额」并合并回 live 状态，
+  // 余额因此回填到 WalletVM，组内每个钱包的余额就能直接显示。这里走 readWalletBalances（只做 1 次
+  // summary 读，不读挂单），每钱包只花 1 个令牌，比完整 reconcile 快一倍；期间用优先级标记让
+  // 后台轮询让位，避免同一批钱包被读两遍。读取受 RateLimiter 限速所以串行，新的请求会接管旧的。
+  const balanceSeq = useRef(0);
+  const refreshWalletBalances = useCallback(async (ids: string[]) => {
+    const seq = ++balanceSeq.current;
+    beginPriorityReads();
+    // 连续多少个钱包读到「余额为 0」；到 3 个就停止继续探测（后面的钱包大概率也是空的，省读预算）
+    const ZERO_STREAK_LIMIT = 3;
+    let zeroStreak = 0;
+    try {
+      for (const id of ids) {
+        if (seq !== balanceSeq.current) return; // 已被新的组选中覆盖
+        if (!isLiveWallet({ id })) continue;
+        try {
+          const upd = await reconcileBalances(id);
+          if (seq !== balanceSeq.current) return;
+          setLive((s) => mergeWallet(s, upd));
+          // 只有「确实读到余额且为 0」才算一个空钱包；读不到结果的情况不算 0，继续往下检测
+          const quote = upd.balances?.find((b) => b.scope === "margin");
+          const total = Number(quote?.total);
+          const isZero = Boolean(quote) && Number.isFinite(total) && total === 0;
+          zeroStreak = isZero ? zeroStreak + 1 : 0;
+          if (zeroStreak >= ZERO_STREAK_LIMIT) return; // 连续 3 个空钱包，停止继续向下检测
+        } catch { zeroStreak = 0; /* 没有结果 ≠ 余额为 0：重置连击，继续检测下一个 */ }
+      }
+    } finally {
+      endPriorityReads();
+    }
+  }, []);
+
+  // Accounting 账本索引：subaccount → 钱包元信息、product_id → marketId，
+  // 让公共 WS 的 fill 帧能翻译成「哪个钱包、哪个市场」的可读记录。
+  useEffect(() => {
+    accountingLedger.setWalletIndex(
+      (live.wallets ?? [])
+        .filter((w) => Boolean(w.subaccount))
+        .map((w) => ({
+          subaccount: w.subaccount as string,
+          meta: { walletId: w.walletId, accountName: w.accountName, cohorts: w.cohort ? [w.cohort] : undefined },
+        })),
+    );
+    accountingLedger.setMarketIndex(
+      (live.products ?? [])
+        .filter((p) => Number.isFinite(p.productId) && Boolean(p.marketId))
+        .map((p) => ({ productId: p.productId, market: p.marketId })),
+    );
+  }, [live.wallets, live.products]);
 
   // Browser-side WS: the public `fill` stream for EVERY cohort subaccount (no key) routes a
   // targeted per-wallet reconcile; a budget-paced round-robin sweep keeps the idle bulk fresh
@@ -67,6 +146,7 @@ export default function Page() {
       url: live.wsSubscribeUrl, subaccounts: subKey.split(","),
       onStatus: (s) => setWsOpen(s === "open"),
       onEvent: (e) => {
+        if (e.type === "fill") accountingLedger.record(e.raw as Record<string, unknown>, e.ts);
         setLiveEvents((xs) => [e, ...xs].slice(0, 20));
         const walletId = e.subaccount ? subToWallet.get(e.subaccount.toLowerCase()) : undefined;
         if (walletId) reconcile(walletId); // targeted, not a full-cohort re-read
@@ -90,6 +170,7 @@ export default function Page() {
     void (async () => {
       while (!stopped) {
         if (cohort.length === 0) { await nap(1000); continue; }
+        if (priorityReadsActive()) { await nap(200); continue; } // 按需批量读余额期间让位，不抢同一个预算
         if (readBudget() <= SWEEP_RESERVE) { await nap(400); continue; } // yield headroom to interactive ops
         const w = cohort[cursor % cohort.length]!;
         cursor++;
@@ -113,7 +194,8 @@ export default function Page() {
   const options = useMemo(() => accountOptions(fleet.accounts), [fleet]);
 
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(() => new Set());
-  const [selectedCohorts, setSelectedCohorts] = useState<Set<string>>(() => new Set());
+  // 账号勾选是否已从本地恢复：恢复前不回写，避免空集合把已保存的选择覆盖掉
+  const [accountsPrefReady, setAccountsPrefReady] = useState(false);
   // 地址搜索：只按开头或结尾匹配（大小写不敏感），输入 0x 前缀也能直接用
   const [search, setSearch] = useState("");
   const [drawerWallet, setDrawerWallet] = useState<WalletVM | null>(null);
@@ -122,8 +204,13 @@ export default function Page() {
   const [checks, setChecks] = useState<Record<string, WalletCheckState>>({});
   const checkWallet = useCallback(async (w: WalletVM) => {
     setChecks((s) => ({ ...s, [w.id]: { status: "running" } }));
+    // 望远镜检查：注册状态与余额并行查，余额读回来直接刷到卡片（非 live 钱包没有读接口，跳过余额）。
+    const balanceTask = isLiveWallet({ id: w.id })
+      ? reconcileBalances(w.id).then((upd) => setLive((s) => mergeWallet(s, upd))).catch(() => {})
+      : Promise.resolve();
     const next = await checkWalletRegistration(w.accountId, w.address.value);
     setChecks((s) => ({ ...s, [w.id]: next }));
+    await balanceTask;
   }, []);
   // 「一键打开 Nado 官网并登录」的每钱包状态（打开的是本机 Playwright 窗口，成功后保留一段时间）
   const [nado, setNado] = useState<Record<string, NadoOpenState>>({});
@@ -139,7 +226,7 @@ export default function Page() {
       setChecks((s) => applyStoredStates(s, state, [{ id: w.id, address: w.address.value }]));
     }
   }, []);
-  // 页面加载 / 刷新 / 从 /nado-login 返回首页后，从后端登记表回填结果（按地址与钱包一一对应）。
+  // 页面加载 / 刷新 / 从 Accounts 页（Nado 登录区块）返回首页后，从后端登记表回填结果（按地址与钱包一一对应）。
   // 依赖地址集合的字符串而不是数组引用：首页的实时刷新会不断生成新的 wallets 数组，
   // 用数组引用做依赖会让这个请求被反复取消，导致后端已有的注册结果迟迟落不到卡片上。
   const walletAddressKey = useMemo(
@@ -206,29 +293,82 @@ export default function Page() {
 
   // Default every real account to checked as it appears (so new accounts show up without the user
   // re-checking); only ADD, so a user's explicit un-check of an existing account is preserved.
+  // 「出现过」的账号 id 记在本地：下次打开页面时，上次取消勾选的账号不会被再次自动勾上，
+  // 而新导入的账号仍会自动勾选。
+  const knownAccounts = useRef<Set<string>>(new Set(readPrefJson<string[]>("accounts.known") ?? []));
   const accountKey = (live.accounts ?? []).map((a) => a.id).join(",");
   useEffect(() => {
     const ids = (live.accounts ?? []).map((a) => a.id);
-    if (ids.length) setSelectedAccounts((s) => {
+    if (!ids.length) return;
+    const fresh = ids.filter((id) => !knownAccounts.current.has(id));
+    if (!fresh.length) return;
+    for (const id of fresh) knownAccounts.current.add(id);
+    writePrefJson("accounts.known", [...knownAccounts.current]);
+    setSelectedAccounts((s) => {
       const next = new Set(s);
-      let added = false;
-      for (const id of ids) if (!next.has(id)) { next.add(id); added = true; }
-      return added ? next : s;
+      for (const id of fresh) next.add(id);
+      return next;
     });
   }, [accountKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // 恢复上次勾选的账号（放在 effect 里，避免 SSR 与首屏渲染不一致）
+  useEffect(() => {
+    const saved = readPrefJson<string[]>("accounts.selected");
+    if (saved) setSelectedAccounts(new Set(saved));
+    setAccountsPrefReady(true);
+  }, []);
+
+  // 记住用户勾选的账号，下次打开页面直接恢复上次的选择
+  useEffect(() => {
+    if (accountsPrefReady) writePrefJson("accounts.selected", [...selectedAccounts]);
+  }, [selectedAccounts, accountsPrefReady]);
+
   const shown = useMemo(() => {
-    const base = filterWallets(fleet.wallets, [...selectedAccounts], [...selectedCohorts]);
+    const base = filterWallets(fleet.wallets, [...selectedAccounts], []);
     const q = search.trim().toLowerCase();
     if (!q) return base;
     return base.filter((w) => {
       const addr = w.address.value.toLowerCase();
       return addr.startsWith(q) || addr.endsWith(q);
     });
-  }, [fleet, selectedAccounts, selectedCohorts, search]);
+  }, [fleet, selectedAccounts, search]);
 
-  const toggleCohort = (c: string) =>
-    setSelectedCohorts((s) => { const n = new Set(s); if (n.has(c)) n.delete(c); else n.add(c); return n; });
+  // 勾选/取消一个钱包；按住 Shift 时按「显示顺序」从锚点连续选中（Windows 资源管理器式）
+  const togglePick = useCallback((w: WalletVM, shift: boolean) => {
+    const to = shown.findIndex((x) => x.id === w.id);
+    const from = pickAnchor.current ? shown.findIndex((x) => x.id === pickAnchor.current) : -1;
+    if (!shift || from < 0 || to < 0) pickAnchor.current = w.id;
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (shift && from >= 0 && to >= 0) {
+        const on = !prev.has(w.id); // 以当前这张卡片的现状决定这一段是选中还是取消
+        const [lo, hi] = from < to ? [from, to] : [to, from];
+        for (let i = lo; i <= hi; i++) {
+          const id = shown[i]!.id;
+          if (on) next.add(id); else next.delete(id);
+        }
+      } else if (next.has(w.id)) {
+        next.delete(w.id);
+      } else {
+        next.add(w.id);
+      }
+      return next;
+    });
+  }, [shown]);
+
+  // 全选当前显示的钱包 / 清空 / 反选（反选只针对当前显示的，被筛选隐藏的已选钱包保持不变）
+  const pickAllShown = () => setPicked(new Set(shown.map((w) => w.id)));
+  const pickNone = () => { pickAnchor.current = null; setPicked(new Set()); };
+  const pickInvert = () => setPicked((prev) => {
+    const visible = new Set(shown.map((w) => w.id));
+    const next = new Set<string>();
+    for (const id of prev) if (!visible.has(id)) next.add(id);
+    for (const id of visible) if (!prev.has(id)) next.add(id);
+    return next;
+  });
+  // 参与配对的钱包 = 当前显示且被勾选的（筛选变化后隐藏的钱包不会偷偷参与）
+  const pickedWallets = useMemo(() => shown.filter((w) => picked.has(w.id)), [shown, picked]);
+  const pickedCount = pickedWallets.length;
 
   // Kumo Sidebar.Provider is the app shell: collapsible="none" keeps the left rail frozen (a fixed
   // <aside>, never a mobile sheet); only <main> scrolls. Width: Kumo honours `defaultWidth` only when
@@ -237,26 +377,28 @@ export default function Page() {
   return (
     <KumoSidebar.Provider
       collapsible="none"
-      style={{ "--sidebar-width": "20rem" } as React.CSSProperties}
+      style={{ "--sidebar-width": railOpen ? `${railWidth}px` : "3.75rem" } as React.CSSProperties}
       className="h-dvh overflow-hidden bg-kumo-canvas text-kumo-default"
     >
       <Sidebar
+        railOpen={railOpen}
+        onToggleRail={() => setRailOpen((v) => !v)}
         workspaceName={live.enabled ? net.networkName : "offline"}
         totalWallets={fleet.wallets.length}
         shownWallets={shown.length}
         shown={shown}
+        pickedWallets={pickedWallets}
         accountOptions={options}
         selectedAccounts={selectedAccounts}
         onAccountsChange={setSelectedAccounts}
-        cohorts={fleet.cohorts}
-        selectedCohorts={selectedCohorts}
-        onToggleCohort={toggleCohort}
         liveMarkets={live.markets}
         liveEnabled={live.enabled}
         liveDefaultProduct={live.defaultProduct}
         liveCohortSize={live.wallets?.length || 3}
         onLiveCohortChange={refreshLive}
         liveWallets={liveWallets}
+        onWalletChanged={refreshLive}
+        onRefreshBalances={refreshWalletBalances}
         onFunded={(ids) => {
           // After a bulk fund, repaint each attempted wallet + the treasury (native gas, collateral,
           // readiness) via the same force-refresh + reconcile chain used by onRefueled.
@@ -268,6 +410,17 @@ export default function Page() {
           }
         }}
       />
+      {/* 拖拽手柄：拖动调整左侧面板宽度（最小 220px，最大画面的 2/3） */}
+      {railOpen && (
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="拖动调整左侧面板宽度"
+          title="拖动调整左侧面板宽度（最大 2/3 屏宽）"
+          onPointerDown={onRailResizeStart}
+          className="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-kumo-brand/40"
+        />
+      )}
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex items-center justify-between gap-4 border-b border-kumo-line bg-kumo-base px-4 py-3">
           {/* The title + status pill never shrink; the "N shown" hint on the right is the part that yields
@@ -298,15 +451,21 @@ export default function Page() {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
-            <span className="flex min-w-0 items-center gap-1 text-kumo-subtle">
-              <span className="truncate">{shown.length} shown · scroll horizontally</span>
-              <ArrowRightIcon className="shrink-0" />
-            </span>
             <LinkButton href="/accounts" variant="secondary" icon={UsersThreeIcon} className="shrink-0">Accounts</LinkButton>
-            <LinkButton href="/nado-login" variant="secondary" icon={SignInIcon} className="shrink-0">Nado Login</LinkButton>
             <Button icon={ReceiptIcon} className="shrink-0" onClick={() => setAccountingOpen(true)}>Accounting</Button>
           </div>
         </header>
+        {/* 勾选工具条：在右侧手动选中参与自成交配对的钱包（左侧面板只显示汇总并据此分组） */}
+        <div className="flex flex-wrap items-center gap-2 border-b border-kumo-line bg-kumo-base px-4 py-1.5">
+          <span className="text-xs text-kumo-subtle" title="Shift + 点击勾选框 = 从上次点选处连续选中">
+            已选 <strong className="text-kumo-default">{pickedCount}</strong> / {shown.length}
+          </span>
+          <Button size="xs" variant="secondary" onClick={pickAllShown}>全选</Button>
+          <Button size="xs" variant="secondary" onClick={pickInvert}>反选</Button>
+          <Button size="xs" variant="secondary" onClick={pickNone}>取消</Button>
+        </div>
+        {/* 右侧钱包栏的分组 + 手动配对板：挂单 = 黄、吃单 = 蓝 */}
+        <CohortPairBoard wallets={shown} pickedIds={picked} onChanged={refreshLive} />
         <CohortFilmstrip wallets={shown} selectedId={drawerWallet?.id} onSelect={setDrawerWallet} />
         <div className="min-h-0 flex-1">
           {fleet.wallets.length === 0 ? (
@@ -323,7 +482,7 @@ export default function Page() {
               <Empty size="sm" icon={<FunnelIcon size={32} className="text-kumo-inactive" />} title="No wallets match the filter" />
             </div>
           ) : (
-            <WalletGrid wallets={shown} selectedId={drawerWallet?.id} onSelect={setDrawerWallet} checks={checks} onCheck={checkWallet} nado={nado} onOpenNado={openNado} />
+            <WalletGrid wallets={shown} selectedId={drawerWallet?.id} onSelect={setDrawerWallet} pickedIds={picked} onTogglePick={togglePick} checks={checks} onCheck={checkWallet} nado={nado} onOpenNado={openNado} />
           )}
         </div>
       </main>
@@ -348,7 +507,14 @@ export default function Page() {
           }
         }}
       />
-      <AccountingView open={accountingOpen} records={bulk.activity} onClose={() => setAccountingOpen(false)} />
+      <AccountingView
+        open={accountingOpen}
+        subaccounts={(live.wallets ?? [])
+          .filter((w) => picked.has(w.walletId))
+          .map((w) => w.subaccount)
+          .filter((s): s is string => Boolean(s))}
+        onClose={() => setAccountingOpen(false)}
+      />
     </KumoSidebar.Provider>
   );
 }

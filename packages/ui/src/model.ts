@@ -25,6 +25,7 @@ export interface WalletVM {
   index: number;            // derivation slot within the account
   address: Address;
   cohorts: string[];        // cohort = tag (rides wative Wallet tags)
+  cohort?: "maker" | "taker"; // 自成交角色分组（占用保留的 wative 标签），未分配时为空
   nativeBalance: string;    // display decimal
   quoteBalance: string;     // display decimal (USD-ish quote)
   status: WalletStatus;

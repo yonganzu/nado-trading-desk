@@ -310,8 +310,9 @@ async function detectRegistration(page, onNote) {
  *  `mode = "check"` 时只登录并判断注册状态，不做任何引导操作。
  *  `onVerified` 在确认登录成功后立即回调（用于先向页面汇报结果）；
  *  `onNote` 用于上报引导流程的告警（不影响登录成功状态）；
- *  `keepOpenMs` > 0 时把浏览器窗口保留一段时间，方便人工查看登录状态。 */
-async function loginWallet(browser, wallet, { keepOpenMs = 0, mode = "login", headless = false, onVerified, onNote } = {}) {
+ *  `keepOpenMs` > 0 时把浏览器窗口保留一段时间，方便人工查看登录状态。
+ *  `keepOpenUntilClosed` 为 true 时不按时间关窗：窗口一直留着，直到用户手动关闭。 */
+async function loginWallet(browser, wallet, { keepOpenMs = 0, keepOpenUntilClosed = false, mode = "login", headless = false, onVerified, onNote } = {}) {
   const account = privateKeyToAccount(wallet.privateKey);
   if (account.address.toLowerCase() !== wallet.address.toLowerCase()) {
     throw new Error(`私钥与地址不匹配（期望 ${wallet.address}，实际 ${account.address}）`);
@@ -384,7 +385,15 @@ async function loginWallet(browser, wallet, { keepOpenMs = 0, mode = "login", he
     // 先汇报成功，再把窗口留给人工查看。
     // 窗口被提前关闭（人工关窗/浏览器退出）不算登录失败，等待异常直接忽略。
     await onVerified?.({ username });
-    if (keepOpenMs > 0) await page.waitForTimeout(keepOpenMs).catch(() => {});
+    if (keepOpenUntilClosed) {
+      // 一直留窗，直到用户自己关闭（每秒检查一次，页面关闭后 waitForTimeout 会抛错，被吞掉后循环退出）
+      const deadline = Date.now() + 24 * 3600 * 1000; // 24 小时兜底，避免异常情况下进程永远不退出
+      while (!page.isClosed() && Date.now() < deadline) {
+        await page.waitForTimeout(1_000).catch(() => {});
+      }
+    } else if (keepOpenMs > 0) {
+      await page.waitForTimeout(keepOpenMs).catch(() => {});
+    }
   } catch (e) {
     // 失败时留一张截图便于排查（文件名只含序号，不含私钥）
     try { await page.screenshot({ path: join(SHOT_DIR, `${wallet.index}-${Date.now()}.png`) }); } catch { /* 截图失败不影响主流程 */ }
@@ -401,13 +410,15 @@ async function main() {
   if (!wallets.length) throw new Error("wallets 为空");
   // 「登录并查看」模式：确认成功后让浏览器窗口停留（上限 10 分钟）
   const keepOpenMs = Math.max(0, Math.min(600_000, Number(payload?.keepOpenMs) || 0));
+  // 「留窗直到手动关闭」：登录成功后不自动关窗（钱包面板的「登录网页」用它）
+  const keepOpenUntilClosed = payload?.keepOpenUntilClosed === true;
   // "check" = 只登录并判断注册状态（无头运行，不弹窗口）；默认 "login" = 完整注册流程
   const mode = payload?.mode === "check" ? "check" : "login";
   // 并发数：同一个浏览器里同时跑几个钱包（每个钱包一个独立 context），上限 8 避免把内存打满
   const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Math.floor(Number(payload?.concurrency) || 1)));
   // 检查模式固定无头；批量登录默认无头（更快、更省内存）；
-  // 「登录并查看」（keepOpenMs > 0）或显式要求时才打开窗口。
-  const headless = mode === "check" ? true : keepOpenMs > 0 ? false : payload?.headless !== false;
+  // 「登录并查看」（keepOpenMs > 0）或「留窗直到关闭」或显式要求时才打开窗口。
+  const headless = mode === "check" ? true : keepOpenUntilClosed || keepOpenMs > 0 ? false : payload?.headless !== false;
 
   await mkdir(SHOT_DIR, { recursive: true });
   const browser = await chromium.launch({
@@ -423,7 +434,7 @@ async function main() {
     const runner = async () => {
       while (cursor < wallets.length) {
         const wallet = wallets[cursor++];
-        await runWallet(browser, wallet, { keepOpenMs, mode, headless });
+        await runWallet(browser, wallet, { keepOpenMs, keepOpenUntilClosed, mode, headless });
       }
     };
     const lanes = Math.min(concurrency, wallets.length);
@@ -436,7 +447,7 @@ async function main() {
 }
 
 /** 登录（或检查）单个钱包，并把结果按钱包序号汇报给父进程。 */
-async function runWallet(browser, wallet, { keepOpenMs, mode, headless }) {
+async function runWallet(browser, wallet, { keepOpenMs, keepOpenUntilClosed, mode, headless }) {
   const startedAt = Date.now();
   let verified = false;
   emitLine({ type: "wallet", status: "running", index: wallet.index, address: wallet.address });
@@ -444,6 +455,7 @@ async function runWallet(browser, wallet, { keepOpenMs, mode, headless }) {
     // 成功的第一时间汇报，随后（查看模式）把窗口留在登录页
     await loginWallet(browser, wallet, {
       keepOpenMs,
+      keepOpenUntilClosed,
       mode,
       headless,
       onVerified: (info) => {

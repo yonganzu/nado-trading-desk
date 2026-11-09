@@ -62,7 +62,8 @@ function pruneJobs(): void {
  *  `mode = "check"` 表示只检查注册状态：无头登录后观察引导弹窗，不做引导操作。
  *  `accountSlug` 只用于把结果登记到注册表（便于按账户对齐）。
  *  `concurrency` 为同一浏览器内同时处理的钱包数（每个钱包一个独立 context）。
- *  `headless` 为 true 时不渲染窗口（更快、更省内存）；「登录并查看」会强制显示窗口。 */
+ *  `headless` 为 true 时不渲染窗口（更快、更省内存）；「登录并查看」会强制显示窗口。
+ *  `keepOpenUntilClosed` 为 true 时不按时间关窗：登录成功后窗口一直留着，直到用户自己关闭。 */
 export function startNadoLoginJob(
   keys: NadoLoginKey[],
   keepOpenMs = 0,
@@ -70,6 +71,7 @@ export function startNadoLoginJob(
   accountSlug?: string,
   concurrency = 1,
   headless = true,
+  keepOpenUntilClosed = false,
 ): NadoLoginJob {
   const job: NadoLoginJob = {
     id: randomUUID(),
@@ -95,7 +97,7 @@ export function startNadoLoginJob(
   children.set(job.id, child);
 
   // 私钥只在内存中通过 stdin 传给 worker，不写文件、不进日志
-  child.stdin.write(JSON.stringify({ wallets: keys, keepOpenMs, mode, concurrency, headless }));
+  child.stdin.write(JSON.stringify({ wallets: keys, keepOpenMs, keepOpenUntilClosed, mode, concurrency, headless }));
   child.stdin.end();
 
   let buffered = "";

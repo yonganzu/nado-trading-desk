@@ -9,6 +9,7 @@ import {
 import type { AccountVM, AccountKind } from "../lib/custody";
 import { QrKeyScanner } from "../components/QrKeyScanner";
 import { ExportPrivateKeysButton, MnemonicPanel } from "../components/AccountExport";
+import { NadoLoginPanel } from "../components/NadoLoginPanel";
 import { useVault } from "../components/AppGate";
 
 const splitKeys = (s: string): string[] => s.split(/[\s,]+/).map((k) => k.trim()).filter(Boolean);
@@ -58,6 +59,18 @@ export default function AccountsPage() {
               accounts.map((a) => <AccountBlock key={a.slug} account={a} onChange={setAccounts} />)
             )}
           </div>
+
+          {/* Nado 官网登录 / 注册：由原 /nado-login 独立页面整合进来。
+              id 供首页「Nado Login」链接直接跳转到本区块。 */}
+          <section id="nado-login" className="flex scroll-mt-6 flex-col gap-3">
+            <div className="flex flex-col gap-1">
+              <Text variant="heading" as="h2">Nado 官网登录 / 注册</Text>
+              <Text variant="secondary" size="xs">
+                用保险库里的钱包自动打开 app.nado.xyz，点击 Sign In → MetaMask 完成 Privy 登录（同一弹窗即注册）。
+              </Text>
+            </div>
+            <NadoLoginPanel accounts={accounts} />
+          </section>
         </div>
       </div>
     </div>

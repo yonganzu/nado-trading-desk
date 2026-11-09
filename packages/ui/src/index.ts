@@ -7,7 +7,7 @@ export type { FleetOptions } from "./mock.js";
 export { filterWallets, accountOptions, cohortsOf } from "./filter.js";
 export type { AccountOption } from "./filter.js";
 export { renderActionForm } from "./form.js";
-export { rollup, toCsv, toJson } from "./accounting.js";
+export { rollup, toCsv, toJson, inferTaker, MAKER_FEE_RATE, TAKER_FEE_RATE, MAKER_VOLUME_PER_POINT, TAKER_VOLUME_PER_POINT } from "./accounting.js";
 export type { AccountingRecord, AccountingReport, Rollup, Totals } from "./accounting.js";
 export { computeReadiness } from "./readiness.js";
 export type { ReadinessInputs } from "./readiness.js";

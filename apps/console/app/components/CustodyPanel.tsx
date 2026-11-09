@@ -21,6 +21,9 @@ export function CustodyPanel({ cohortSize, product, onCohortChange, isTestnet }:
   const [wallets, setWallets] = useState<CohortWallet[]>(cohortWallets());
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  // 面板默认展开条件：未解锁时必须看到密码/助记词输入框，所以只会在已解锁时默认收起
+  // （已解锁时钱包列表很长，收起后侧边栏能短一大截）。
+  const [open, setOpen] = useState(() => !(cohortWallets().length > 0 && isUnlocked()));
   const n = Math.max(1, cohortSize ?? 3);
   const unlocked = wallets.length > 0 && isUnlocked();
 
@@ -61,7 +64,21 @@ export function CustodyPanel({ cohortSize, product, onCohortChange, isTestnet }:
   // its own controls (unclickable) instead of letting the sidebar scroll.
   return (
     <LayerCard className="shrink-0">
-      <LayerCard.Secondary>In-browser custody · {unlocked ? "unlocked" : "locked"}</LayerCard.Secondary>
+      <LayerCard.Secondary>
+        <div className="flex items-center justify-between gap-2">
+          <span>In-browser custody · {unlocked ? "unlocked" : "locked"}</span>
+          <button
+            type="button"
+            aria-label={open ? "Collapse custody panel" : "Expand custody panel"}
+            title={open ? "Collapse" : "Expand"}
+            onClick={() => setOpen((v) => !v)}
+            className="text-xs text-kumo-subtle underline-offset-2 hover:text-kumo-default hover:underline"
+          >
+            {open ? "Hide" : "Show"}
+          </button>
+        </div>
+      </LayerCard.Secondary>
+      {open && (
       <LayerCard.Primary className="flex flex-col gap-3">
         {!unlocked ? (
           <>
@@ -100,6 +117,7 @@ export function CustodyPanel({ cohortSize, product, onCohortChange, isTestnet }:
           Keys are generated/imported and sign in this browser tab (IndexedDB) and never reach the server. The live fleet, order signing, funding (deposit on-chain + withdraw) and reads all run in-tab via the keyless relay (deposits broadcast to the Ink RPC directly) — the server holds no key.
         </Text>
       </LayerCard.Primary>
+      )}
     </LayerCard>
   );
 }
