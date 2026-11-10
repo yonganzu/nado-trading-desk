@@ -7,6 +7,7 @@ import { rollup, toCsv, toJson, MAKER_VOLUME_PER_POINT, TAKER_VOLUME_PER_POINT }
 import type { Rollup, Totals } from "@farm/ui";
 import { accountingLedger } from "../lib/accountingLedger";
 import { AccountingDeposits } from "./AccountingDeposits";
+import { AccountingSummary } from "./AccountingSummary";
 import { subscribeExclusions, withoutExcludedWallets } from "../lib/accountingExclusions";
 import { PointCostChart } from "./PointCostChart";
 
@@ -150,7 +151,15 @@ function SplitTable({ totals }: { totals: Totals }) {
 
 /** 成交账本弹窗：数据来自公共 WS fill 流（本地 FIFO 计算盈亏），并落库到服务端。
  *  保持挂载、由 `open` 驱动（Kumo dialog-rendering 规则）；只有 body 滚动。 */
-export function AccountingView({ open, onClose, subaccounts = [] }: { open: boolean; onClose: () => void; subaccounts?: string[] }) {
+export function AccountingView({ open, onClose, subaccounts = [], balanceUsdt0 = 0, balanceKnown = 0, balanceTotal = 0 }: {
+  open: boolean;
+  onClose: () => void;
+  subaccounts?: string[];
+  /** 所有钱包当前的 USDT0 合计（页面实时读数汇总），用于顶部「剩余资金」 */
+  balanceUsdt0?: number;
+  balanceKnown?: number;
+  balanceTotal?: number;
+}) {
   // 账本就地变更，通过订阅 version 触发重渲染；打开时再重算 rollup。
   const [, setVersion] = useState(0);
   useEffect(() => accountingLedger.subscribe(() => setVersion((v) => v + 1)), []);
@@ -210,12 +219,18 @@ export function AccountingView({ open, onClose, subaccounts = [] }: { open: bool
           {report && t && (
             // pt-1: Body is a scroll container with no top padding, which clipped the stat cards' ring.
             <div className="flex flex-col gap-4 pt-1">
-              {/* 只保留用户关心的口径：挂/吃成交量、挂/吃手续费、积分、积分成本、手续费以外的损耗 */}
+              {/* 顶部总览：累计充值 + 所有钱包剩余资金（不依赖成交账本，先展示） */}
+              <AccountingSummary
+                open={open}
+                subaccounts={subaccounts}
+                balanceUsdt0={balanceUsdt0}
+                balanceKnown={balanceKnown}
+                balanceTotal={balanceTotal}
+              />
+              {/* 只保留用户关心的口径：挂/吃成交量、积分、积分成本、手续费以外的损耗 */}
               <Grid variant="4up" gap="sm">
                 <Stat label="Maker volume（挂单成交量）" value={t.makerVolume.toFixed(2)} />
                 <Stat label="Taker volume（吃单成交量）" value={t.takerVolume.toFixed(2)} />
-                <Stat label="Maker fees（挂单手续费）" value={t.makerFees.toFixed(4)} />
-                <Stat label="Taker fees（吃单手续费）" value={t.takerFees.toFixed(4)} />
               </Grid>
               <Grid variant="4up" gap="sm">
                 {/* 积分口径：挂单每 16000 名义额 1 分、吃单每 2500 名义额 1 分，按比例累计 */}

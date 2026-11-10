@@ -191,6 +191,20 @@ export default function Page() {
   }, [live.enabled, live.wsSubscribeUrl, subKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const liveWallets = useMemo(() => liveWalletVMs(live), [live]);
+  // Accounting 顶部「剩余资金」：所有钱包已读到的 USDT0（margin）合计。
+  // 还没读到余额的钱包不计入金额，只用 known / total 标明覆盖情况。
+  const walletBalance = useMemo(() => {
+    const list = live.wallets ?? [];
+    let sum = 0;
+    let known = 0;
+    for (const w of list) {
+      const n = Number(w.balances?.find((b) => b.scope === "margin")?.total ?? NaN);
+      if (!Number.isFinite(n)) continue;
+      sum += n;
+      known++;
+    }
+    return { sum, known, total: list.length };
+  }, [live.wallets]);
   const fleet = useMemo<Fleet>(() => ({
     accounts: live.accounts ?? [],
     wallets: liveWallets,
@@ -520,6 +534,9 @@ export default function Page() {
           .map((w) => w.subaccount)
           .filter((s): s is string => Boolean(s))}
         onClose={() => setAccountingOpen(false)}
+        balanceUsdt0={walletBalance.sum}
+        balanceKnown={walletBalance.known}
+        balanceTotal={walletBalance.total}
       />
     </KumoSidebar.Provider>
   );

@@ -11,13 +11,38 @@ export interface DepositRecord {
   ts: number;
 }
 
+type DepositsResult = { records: DepositRecord[]; truncated: boolean };
+
+/** 结果缓存（默认 60 秒）：Accounting 顶部的「已充值」和底部的「净充值」共用同一份，
+ *  打开弹窗时不会向 indexer 重复请求；手动刷新时传 force 跳过缓存。 */
+const CACHE_TTL_MS = 60_000;
+const cache = new Map<string, { at: number; value: DepositsResult }>();
+const inflight = new Map<string, Promise<DepositsResult>>();
+
 /** 拉取一批子账户的充值 / 提币记录（服务端转发 indexer，keyless 只读）。 */
-export async function fetchDeposits(subaccounts: readonly string[]): Promise<{ records: DepositRecord[]; truncated: boolean }> {
+export async function fetchDeposits(subaccounts: readonly string[], opts?: { force?: boolean }): Promise<DepositsResult> {
   if (subaccounts.length === 0) return { records: [], truncated: false };
-  const res = await fetch(`/api/accounting/deposits?subaccounts=${encodeURIComponent(subaccounts.join(","))}`);
-  const data = (await res.json()) as { ok?: boolean; error?: string; records?: DepositRecord[]; truncated?: boolean };
-  if (!data?.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
-  return { records: Array.isArray(data.records) ? data.records : [], truncated: Boolean(data.truncated) };
+  const key = subaccounts.join(",");
+  if (!opts?.force) {
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.value;
+    const running = inflight.get(key);
+    if (running) return running;
+  }
+  const task = (async (): Promise<DepositsResult> => {
+    const res = await fetch(`/api/accounting/deposits?subaccounts=${encodeURIComponent(subaccounts.join(","))}`);
+    const data = (await res.json()) as { ok?: boolean; error?: string; records?: DepositRecord[]; truncated?: boolean };
+    if (!data?.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+    const value = { records: Array.isArray(data.records) ? data.records : [], truncated: Boolean(data.truncated) };
+    cache.set(key, { at: Date.now(), value });
+    return value;
+  })();
+  inflight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    inflight.delete(key);
+  }
 }
 
 /** 子账户 bytes32 → 钱包地址的短标签（0xee69c6b12313… → 0xee69…a74F）。 */

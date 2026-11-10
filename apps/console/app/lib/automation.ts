@@ -19,6 +19,7 @@ import { MIN_SPREAD_TICKS } from "./tradingRules";
 import { ensureClockOffset } from "./nadoClock";
 import { balancePairRoles, ROLE_BALANCE_ENABLED } from "./roleBalance";
 import { pickFatterMarket } from "./marketSwitch";
+import { BALANCE_CHECK_EVERY, MIN_BALANCE_USDT0, guardByBalance } from "./balanceGuard";
 import { getLiveConfig, productFor } from "./liveConfig";
 import { startBboCache, stopBboCache, getBboQuote } from "./bboCache";
 import { notePairInventory, inventorySummary, resetInventoryWatch,
@@ -89,6 +90,8 @@ export interface RoundHooks {
   reloadRoles?: () => { makers: WalletVM[]; takers: WalletVM[] } | null;
   /** 点差不足连续多轮后自动换了标的：页面据此同步 Market 选择框，避免面板显示的还是旧标的。 */
   onMarketChanged?: (market: string) => void;
+  /** 每 BALANCE_CHECK_EVERY 轮做余额体检之前，让页面把余额刷新到最新（没有实现就跳过体检）。 */
+  refreshBalances?: () => Promise<void> | void;
 }
 
 export interface RoundResult {
@@ -674,7 +677,9 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
   let eMakers = await eligible(makers, "maker", hooks);
   let eTakers = await eligible(takers, "taker", hooks);
   // 手动配对的名单也要过一遍「可交易」检查：任一腿不可用就跳过这一对，别拖累其它配对
-  const pinned = base.manualPairs?.filter(([m, t]) => eMakers.includes(m) && eTakers.includes(t)) ?? [];
+  let pinned = base.manualPairs?.filter(([m, t]) => eMakers.includes(m) && eTakers.includes(t)) ?? [];
+  // 余额体检中被剔除的钱包：收尾平仓时也要带上，避免它们留下敞口
+  const culled: WalletVM[] = [];
   // 手动配对 = 用户把 maker/taker 角色定死了，余额自动平衡不去覆盖它
   if (pinned.length) hooks.log("⚖ 手动配对已锁定角色，余额自动平衡不生效。");
   if (base.manualPairs?.length && pinned.length === 0) {
@@ -723,6 +728,28 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
       if (reloaded) { eMakers = reloaded.makers; eTakers = reloaded.takers; }
       hooks.onRolesChanged?.();
     }
+    // 每 BALANCE_CHECK_EVERY 轮做一次余额体检：先让页面把余额刷新到最新，
+    // 再剔除余额低于 MIN_BALANCE_USDT0 的钱包，并把因搭档被剔除而落单的钱包重新配对。
+    if (round % BALANCE_CHECK_EVERY === 0 && hooks.balanceOf) {
+      await hooks.refreshBalances?.();
+      const g = guardByBalance({ makers: eMakers, takers: eTakers, pairs: pinned, balanceOf: hooks.balanceOf });
+      if (g.dropped.length > 0) {
+        hooks.log(`⚖ 余额体检：剔除 ${g.dropped.length} 个余额低于 ${MIN_BALANCE_USDT0} USDT0 的钱包 — ${g.dropped.map(short).join("、")}`);
+      }
+      if (g.addedPairs > 0) hooks.log(`⚖ 余额体检：落单的钱包重新配对 ${g.addedPairs} 对`);
+      if (g.unpaired.length > 0) {
+        hooks.log(`⚠ 余额体检：${g.unpaired.map(short).join("、")} 凑不成对，本次运行暂不参与`);
+      }
+      eMakers = g.makers;
+      eTakers = g.takers;
+      pinned = g.pairs;
+      culled.push(...g.dropped);
+      if (eMakers.length === 0 || eTakers.length === 0) {
+        hooks.log("■ 余额体检后没有再能配对的钱包 — stopping.");
+        break;
+      }
+      hooks.onRolesChanged?.(); // 让页面同步最新余额与钱包列表
+    }
     // Stop when the run can't make progress: an empty cohort, a cohort that hit its cumulative cap, or a
     // run of consecutive rounds that trade nothing (a tight market or every wallet capped) — a single
     // transient dead round is tolerated. A normal round keeps looping (the setTimeout(0) yields between).
@@ -758,7 +785,7 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
   }
   // 循环结束（跑满轮次 / 提前停止 / Pause）后再清扫一遍：有未平仓位就市价全部平掉，
   // 不留敞口给下一次运行。这里不带 signal，Pause 也会照常执行。
-  await flattenAll([...eMakers, ...eTakers], hooks, "end");
+  await flattenAll([...eMakers, ...eTakers, ...culled], hooks, "end");
   // 收尾平仓的单子也可能就是这个 run 的最后成交：停之前把最后一轮的盈亏补上
   if (pnlMark) hooks.log(roundPnlLine(pnlMark.round, realizedPnlOf(runWalletIds) - pnlMark.base));
   stopBboCache(); // 收尾后关掉行情订阅（页面自己的点差监听不受影响）

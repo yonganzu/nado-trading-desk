@@ -376,6 +376,15 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
           const n = Number(q ?? NaN);
           return Number.isFinite(n) ? n : null;
         },
+        // 每 10 轮的余额体检：先让页面把这批钱包的余额重新读一遍（受页面的读取限速控制），
+        // 等一拍让新读数渲染进 walletsRef，引擎随后就能按最新余额剔除 / 重新配对。
+        refreshBalances: async () => {
+          if (!onRefreshBalances) return;
+          const ids = walletsRef.current.map((w) => w.id);
+          if (ids.length === 0) return;
+          await onRefreshBalances(ids);
+          await new Promise((r) => setTimeout(r, 200));
+        },
         // 角色被互换后按最新的 cohort 标签重新分组，下一轮按新角色配对
         reloadRoles: () => {
           const cur = walletsRef.current;

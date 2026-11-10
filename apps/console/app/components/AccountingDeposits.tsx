@@ -21,14 +21,14 @@ export function AccountingDeposits({ open, subaccounts }: { open: boolean; subac
   const [, bump] = useState(0);
   useEffect(() => subscribeExclusions(() => bump((v) => v + 1)), []);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force?: boolean) => {
     if (!subsKey) {
       setState({ loading: false, records: [], note: "先在右侧选中钱包，再拉充值记录" });
       return;
     }
     setState((s) => ({ ...s, loading: true, note: undefined }));
     try {
-      const { records, truncated } = await fetchDeposits(subsKey.split(","));
+      const { records, truncated } = await fetchDeposits(subsKey.split(","), { force });
       setState({ loading: false, records, truncated });
     } catch (e) {
       setState({ loading: false, records: [], note: `充值记录查询失败：${e instanceof Error ? e.message : String(e)}` });
@@ -57,7 +57,7 @@ export function AccountingDeposits({ open, subaccounts }: { open: boolean; subac
         <Button
           icon={ArrowCounterClockwiseIcon}
           variant="secondary"
-          onClick={() => { void load(); }}
+          onClick={() => { void load(true); }}
           disabled={state.loading || !subsKey}
         >
           {state.loading ? "拉取中…" : "刷新净充值"}
