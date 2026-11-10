@@ -6,7 +6,8 @@ import { ArrowCounterClockwiseIcon, DownloadSimpleIcon, ReceiptIcon } from "@pho
 import { rollup, toCsv, toJson, MAKER_VOLUME_PER_POINT, TAKER_VOLUME_PER_POINT } from "@farm/ui";
 import type { Rollup, Totals } from "@farm/ui";
 import { accountingLedger } from "../lib/accountingLedger";
-import { withoutExcludedWallets } from "../lib/accountingExclusions";
+import { AccountingDeposits } from "./AccountingDeposits";
+import { subscribeExclusions, withoutExcludedWallets } from "../lib/accountingExclusions";
 import { PointCostChart } from "./PointCostChart";
 
 function download(filename: string, content: string, type: string): void {
@@ -153,6 +154,8 @@ export function AccountingView({ open, onClose, subaccounts = [] }: { open: bool
   // 账本就地变更，通过订阅 version 触发重渲染；打开时再重算 rollup。
   const [, setVersion] = useState(0);
   useEffect(() => accountingLedger.subscribe(() => setVersion((v) => v + 1)), []);
+  // 钱包面板上切换「是否计入统计」时，这里同步重算（排除名单改的是模块内状态）
+  useEffect(() => subscribeExclusions(() => setVersion((v) => v + 1)), []);
 
   // 每次打开弹窗都向服务端再同步一次（合并去重、不清空本地）：
   // 之前只在模块加载时 hydrate 一次，若那次请求失败（例如开发服务器正在重编译），
@@ -173,12 +176,13 @@ export function AccountingView({ open, onClose, subaccounts = [] }: { open: bool
     }
     setHistory({ loading: true });
     try {
-      const res = await fetch(`/api/accounting/history?subaccounts=${encodeURIComponent(subsKey)}&perWallet=1000`);
+      // 每钱包 5000 条：旧值 1000 会把更早的成交截断，导致积分偏低（wallet0 实际 2326 笔）
+      const res = await fetch(`/api/accounting/history?subaccounts=${encodeURIComponent(subsKey)}&perWallet=5000`);
       const data = (await res.json()) as { ok?: boolean; error?: string; records?: unknown; truncated?: boolean };
       if (!data?.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
       const list = Array.isArray(data.records) ? data.records : [];
       const added = accountingLedger.importRecords(list);
-      const tail = data.truncated ? "（每个钱包最多取 1000 条，超出部分未显示）" : "";
+      const tail = data.truncated ? "（每个钱包最多取 5000 条，超出部分未显示）" : "";
       setHistory({ loading: false, note: added > 0 ? `已补 ${added} 条历史成交（官方 indexer）${tail}` : "该钱包没有新的历史成交" });
     } catch (e) {
       setHistory({ loading: false, note: `历史查询失败：${e instanceof Error ? e.message : String(e)}` });
@@ -262,7 +266,6 @@ export function AccountingView({ open, onClose, subaccounts = [] }: { open: bool
                 />
               ) : (
                 <>
-                  <RollupTable title="By cohort" rows={report.byCohort} keyLabel="Cohort" />
                   <RollupTable title="By wallet" rows={report.byWallet} keyLabel="Wallet" />
                   {/* 表头口径说明：积分成本按「Wear ÷ 积分」给，已把开平仓吃掉的盈亏一起算进去 */}
                   <Text variant="secondary" size="xs">
@@ -288,6 +291,8 @@ export function AccountingView({ open, onClose, subaccounts = [] }: { open: bool
                 <Button icon={ArrowCounterClockwiseIcon} variant="secondary" onClick={() => { void accountingLedger.reset(); }} disabled={records.length === 0}>Reset ledger</Button>
               </div>
               {history.note && <Text variant="secondary" size="xs">{history.note}</Text>}
+              {/* 净充值：充值（deposit_collateral）− 提币（withdraw_collateral / _v2），来自官方 indexer */}
+              <AccountingDeposits open={open} subaccounts={subaccounts} />
             </div>
           )}
         </LayerDialog.Body>

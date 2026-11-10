@@ -66,6 +66,10 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
   const latRef = useRef<number[]>([]);     // recent per-pair latencies (ms), for p99
   const timesRef = useRef<number[]>([]);   // traded-pair timestamps in the last window, for pairs/sec
   const startedAtRef = useRef(0);          // run start, so pairs/sec divides by elapsed (not a fixed 10s)
+  // 最新的钱包列表：引擎的角色平衡 / 重新分组回调在若干轮之后才触发，
+  // 那时闭包里的 wallets 已经过期，必须从这里读当轮的数据。
+  const walletsRef = useRef<WalletVM[]>(wallets);
+  walletsRef.current = wallets;
 
   // 点差检查结果（marketId → 是否够打自成交）。null = 还没拉回来，此时不筛，避免打开页面先把列表清空。
   const [spreadOk, setSpreadOk] = useState<Record<string, boolean> | null>(null);
@@ -116,6 +120,8 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
   }, [isLive, chainId]);
 
   useEffect(() => {
+    // 运行中引擎可能因为点差不足自动换了标的（onMarketChanged），这里别再把它改回去
+    if (running) return;
     if (tradeMarkets.length && !tradeMarkets.some((m) => m.id === market)) {
       const pick = tradeMarkets.find((m) => symbolOf(m.id) === "BTC-PERP") ?? tradeMarkets[0]!;
       setMarket(pick.id);
@@ -246,7 +252,7 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
   const runCohortSplit = async () => {
     const total = wallets.length;
     if (total < 2) {
-      append(total ? "Only 1 wallet selected — need ≥2 to form a maker/taker pair." : "Select wallets first, then re-run Cohort.");
+      append(total ? "只选了 1 个钱包 —— 至少 2 个才能配对。" : "先勾选钱包，再点「自动配对」。");
       return;
     }
     const half = Math.floor(total / 2);
@@ -274,7 +280,7 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
     }
     if (plan.length === 0) {
       // 完全平衡（或只差 1 个、且多出来的已经在某一侧）时不做任何写操作，按真实数量回报
-      append(`✓ already balanced：${curM.length} maker / ${curT.length} taker，无需调整。`);
+      append(`✓ 已平衡：两组各 ${curM.length} / ${curT.length} 个，无需调整。`);
       return;
     }
     setBusy(true);
@@ -286,7 +292,7 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
         done++;
         if (step.cohort === "maker") toMaker++;
       }
-      append(`✓ balanced ${plan.length} wallet(s) → ${keepM.length + toMaker} maker / ${keepT.length + (done - toMaker)} taker`);
+      append(`✓ 已重新分组 ${plan.length} 个钱包 → 两组 ${keepM.length + toMaker} / ${keepT.length + (done - toMaker)}`);
     } catch (e) {
       append(`✗ balance stopped at ${done}/${plan.length} (kept ${keepM.length}M / ${keepT.length}T) — re-run to finish: ${(e as Error).message}`);
     } finally {
@@ -321,7 +327,7 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
     if (makerCount === 0 || takerCount === 0) {
       return pinned.length > 0
         ? `✗ 已配对的 ${pinned.length} 对里有钱包不在当前勾选/分组里——重新在右侧配对板确认一下。`
-        : "✗ 先分组：在右侧配对板给钱包指定「挂单 / 吃单」（或点 Cohort 随机分组），至少各一个。";
+        : "✗ 先分组：在右侧配对板把钱配好（或点「自动配对」随机分组），至少两两成对。";
     }
     return null;
   };
@@ -364,6 +370,22 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
         onPairEnd: (pair, outcome, ms) => { automationProgress.pairEnd(pair); if (outcome === "traded") recordPair(ms); },
         // 开跑前的余额检查若换了角色，立刻刷新钱包列表，maker/taker 标签即时更新
         onRolesChanged: () => onWalletChanged?.(),
+        // 逐对角色平衡优先用页面已扫到的余额（零 REST 开销）；没有读数返回 null，引擎会跳过这一对
+        balanceOf: (id) => {
+          const q = walletsRef.current.find((w) => w.id === id)?.quoteBalance;
+          const n = Number(q ?? NaN);
+          return Number.isFinite(n) ? n : null;
+        },
+        // 角色被互换后按最新的 cohort 标签重新分组，下一轮按新角色配对
+        reloadRoles: () => {
+          const cur = walletsRef.current;
+          return {
+            makers: cur.filter((w) => w.cohort === "maker"),
+            takers: cur.filter((w) => w.cohort === "taker"),
+          };
+        },
+        // 点差连续不足时引擎会自动换标的：同步面板的 Market 选择框（并写入本地偏好）
+        onMarketChanged: (id) => { setMarket(id); setMarketText(symbolOf(id)); },
       });
     } catch (e) {
       append(`✗ automation error: ${(e as Error).message}`);
@@ -474,13 +496,13 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
 
       {/* 参与配对的钱包来自右侧钱包卡片的勾选（Shift 可连选）；分组与手动配对在右侧顶部的配对板 */}
       <div className="flex flex-col gap-1">
-        <span className="text-sm font-medium">已选 {pool.length} 个钱包 · {makerCount} maker / {takerCount} taker</span>
+        <span className="text-sm font-medium">已选 {pool.length} 个钱包</span>
         {pinned.length > 0 ? (
           <Text variant="secondary" size="xs">按右侧配对板的 {pinned.length} 对逐一开打。</Text>
         ) : pool.length === 0 ? (
-          <Text variant="secondary" size="xs">在右侧钱包卡片左上角打勾选择参与配对的钱包（Shift + 点选可连续选中），再到右侧「挂单 / 吃单」配对板指定角色。</Text>
+          <Text variant="secondary" size="xs">在右侧钱包卡片左上角打勾选择参与配对的钱包（Shift + 点选可连续选中），再到右侧配对板两两配对。</Text>
         ) : (
-          <Text variant="secondary" size="xs">配对只在勾选的钱包里进行；先在右侧配对板指定挂单 / 吃单（或点 Cohort 自动分组），再 Run。</Text>
+          <Text variant="secondary" size="xs">配对只在勾选的钱包里进行；先在右侧配对板配好对（或点「自动配对」随机分组），再 Run。</Text>
         )}
         {fetchingBalances && <Text variant="secondary" size="xs">读取已选钱包余额中…</Text>}
       </div>
@@ -488,10 +510,10 @@ export function TradingStrategy({ wallets, markets, onWalletChanged, onRefreshBa
       {/* Step 1 — the Cohort pre-step. Explicitly the prerequisite to Run automation. */}
       <div className="flex flex-col gap-1">
         <Button size="sm" variant="secondary" loading={busy} onClick={runCohortSplit}>
-          Cohort · {makerCount}M / {takerCount}T
+          自动配对
         </Button>
-        <Text variant="secondary" size="xs">Step 1 — 把已选钱包平衡成 maker / taker 数量相等（奇数时差 1）；已有分组尽量保留，可反复点。</Text>
-        {/* 手动指定角色 / 配对已迁到右侧钱包栏顶部的「挂单 / 吃单」配对板 */}
+        <Text variant="secondary" size="xs">Step 1 — 自动把已选钱包随机分成两组，数量尽量相等（奇数时差 1）；已有分组尽量保留，可反复点。</Text>
+        {/* 手动配对已迁到右侧钱包栏顶部的配对板（角色不再展示，底层逻辑不变） */}
       </div>
 
       {/* Point 4 — the Run/Pause toggle: continuous self-cross rounds over the split cohort. Idle shows a

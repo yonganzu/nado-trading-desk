@@ -1,11 +1,12 @@
 "use client";
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@cloudflare/kumo";
-import { ArrowSquareOutIcon, CheckIcon, CircleNotchIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
+import { ArrowSquareOutIcon, CheckIcon, CircleNotchIcon, EyeIcon, EyeSlashIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
 import type { WalletVM } from "@farm/ui";
 import { WalletCard } from "./WalletCard";
+import { excludedAddresses, setAddressExcluded, subscribeExclusions } from "../lib/accountingExclusions";
 import type { WalletCheckState } from "../lib/walletCheck";
 import type { NadoOpenState } from "../lib/nadoOpen";
 
@@ -35,6 +36,14 @@ export function WalletGrid({ wallets, selectedId, onSelect, pickedIds, onToggleP
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [cols, setCols] = useState(1);
+
+  // 被排除在 Accounting 统计之外的钱包地址（眼睛图标的开关状态）
+  const [excluded, setExcluded] = useState<string[]>([]);
+  useEffect(() => {
+    setExcluded(excludedAddresses());
+    return subscribeExclusions(() => setExcluded(excludedAddresses()));
+  }, []);
+  const excludedSet = new Set(excluded);
 
   // 根据容器宽度算每行能放几张卡片（窗口/侧栏宽度变化时自动重算）
   useLayoutEffect(() => {
@@ -75,6 +84,8 @@ export function WalletGrid({ wallets, selectedId, onSelect, pickedIds, onToggleP
                 const nadoState = nado?.[w.id];
                 const opening = nadoState?.status === "opening";
                 const picked = pickedIds?.has(w.id) ?? false;
+                // 该钱包是否被排除在 Accounting 统计之外（眼睛斜杠 = 不计入）
+                const hidden = excludedSet.has(w.address.value.toLowerCase());
                 return (
                   <div key={w.id} style={{ width: CARD_W, height: CARD_H, flex: "0 0 auto", position: "relative" }}>
                     <WalletCard wallet={w} selected={w.id === selectedId} picked={picked} pickable={!!onTogglePick} onSelect={onSelect} check={check} nado={nadoState} />
@@ -122,6 +133,21 @@ export function WalletGrid({ wallets, selectedId, onSelect, pickedIds, onToggleP
                         {running
                           ? <CircleNotchIcon size={12} className="animate-spin" />
                           : <MagnifyingGlassIcon size={12} />}
+                      </button>
+                      {/* 统计开关：决定这个钱包的成交是否计入 Accounting 的汇总/积分/导出 */}
+                      <button
+                        type="button"
+                        data-testid="wallet-stats-toggle"
+                        aria-pressed={!hidden}
+                        title={hidden ? "该钱包未计入 Accounting 统计（点击恢复）" : "不计入 Accounting 统计（隐藏该钱包对整体数据的影响）"}
+                        aria-label={`切换 #${w.index} 是否计入 Accounting 统计`}
+                        onClick={() => setAddressExcluded(w.address.value, !hidden)}
+                        className={cn(
+                          "grid size-5 place-items-center rounded hover:bg-kumo-tint",
+                          hidden ? "text-kumo-inactive hover:text-kumo-subtle" : "text-kumo-subtle hover:text-kumo-default",
+                        )}
+                      >
+                        {hidden ? <EyeSlashIcon size={12} /> : <EyeIcon size={12} />}
                       </button>
                     </div>
                   </div>

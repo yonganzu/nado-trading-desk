@@ -6,7 +6,6 @@ import { Badge, LayerCard, cn } from "@cloudflare/kumo";
 import type { BadgeVariant } from "@cloudflare/kumo";
 import type { WalletVM, WalletStatus } from "@farm/ui";
 import { AccountKindBadge } from "./AccountKindBadge";
-import { MAKER_ACCENT, MAKER_CHIP, TAKER_ACCENT, TAKER_CHIP } from "../lib/cohortColors";
 import type { WalletCheckState } from "../lib/walletCheck";
 import type { NadoOpenState } from "../lib/nadoOpen";
 
@@ -50,9 +49,7 @@ export const WalletCard = memo(function WalletCard({ wallet, selected, picked, p
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand",
         selected && "ring-2 ring-kumo-brand",
         picked && "bg-kumo-brand/5 ring-2 ring-kumo-brand",
-        // 分组标识色：挂单 = 黄、吃单 = 蓝（左侧竖条比徽标更容易在大列表里扫到）
-        wallet.cohort === "maker" && MAKER_ACCENT,
-        wallet.cohort === "taker" && TAKER_ACCENT,
+        // 卡片上不再显示自成交角色（底层仍按 cohort 分组，只是不在这里展示）
       )}
     >
       <div className={cn("flex items-center justify-between gap-2", pickable && "pl-6")}>
@@ -71,12 +68,6 @@ export const WalletCard = memo(function WalletCard({ wallet, selected, picked, p
         </div>
       </div>
       <div className="flex flex-wrap gap-1">
-        {wallet.cohort === "maker" && (
-          <span className={cn("rounded border px-1.5 py-0.5 text-xs", MAKER_CHIP)}>挂单</span>
-        )}
-        {wallet.cohort === "taker" && (
-          <span className={cn("rounded border px-1.5 py-0.5 text-xs", TAKER_CHIP)}>吃单</span>
-        )}
         {wallet.cohorts.filter((c) => c !== "maker" && c !== "taker").map((c) => <Badge key={c} variant="secondary">{c}</Badge>)}
         {check?.status === "registered" && <Badge variant="success">已注册</Badge>}
         {check?.status === "unregistered" && <Badge variant="warning">未注册</Badge>}

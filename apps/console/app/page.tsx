@@ -12,7 +12,7 @@ import { CohortFilmstrip } from "./components/CohortFilmstrip";
 import { CohortPairBoard } from "./components/CohortPairBoard";
 import { AccountingView } from "./components/AccountingView";
 import { useNetwork } from "./components/NetworkProvider";
-import { fetchLiveState, reconcileWallet, reconcileBalances, mergeWallet, liveWalletVMs, isLiveWallet } from "./lib/live";
+import { fetchLiveState, reconcileWallet, reconcileBalances, mergeWallet, mergeLiveReads, liveWalletVMs, isLiveWallet } from "./lib/live";
 import { readBudget, forceRefreshNative, TREASURY_WALLET_ID, beginPriorityReads, endPriorityReads, priorityReadsActive } from "./lib/liveContext";
 import { readPrefJson, writePrefJson } from "./lib/prefs";
 import { openOrderUpdateStream } from "./lib/orderUpdateStream";
@@ -61,7 +61,13 @@ export default function Page() {
   // Repopulate the live fleet IDENTITIES (keyless config + in-tab cohort; no per-wallet reads).
   // Called on mount and on cohort change (unlock/lock/import); the budget-paced sweep + the
   // WS-targeted reconcile fill in each wallet's reads afterward.
-  const refreshLive = useCallback(() => { fetchLiveState().then(setLive).catch(() => {}); }, []);
+  // 注意：身份刷新不能把已经读到的余额/挂单丢掉（改 maker/taker、余额自动换角色都会走到这里），
+  // 所以合并旧读数而不是整份替换 —— 否则面板上的余额会突然集体变回「—」。
+  const refreshLive = useCallback(() => {
+    fetchLiveState()
+      .then((s) => setLive((prev) => mergeLiveReads(s, prev)))
+      .catch(() => {});
+  }, []);
   useEffect(() => { refreshLive(); }, [refreshLive, chainId]); // re-fetch + reconnect on a network switch
 
   // 按需读取一组钱包的余额（交易面板选中钱包组时触发）：逐个「只读余额」并合并回 live 状态，
@@ -464,7 +470,7 @@ export default function Page() {
           <Button size="xs" variant="secondary" onClick={pickInvert}>反选</Button>
           <Button size="xs" variant="secondary" onClick={pickNone}>取消</Button>
         </div>
-        {/* 右侧钱包栏的分组 + 手动配对板：挂单 = 黄、吃单 = 蓝 */}
+        {/* 右侧钱包栏的手动配对板（角色不再展示，底层仍按 cohort 分组） */}
         <CohortPairBoard wallets={shown} pickedIds={picked} onChanged={refreshLive} />
         <CohortFilmstrip wallets={shown} selectedId={drawerWallet?.id} onSelect={setDrawerWallet} />
         <div className="min-h-0 flex-1">

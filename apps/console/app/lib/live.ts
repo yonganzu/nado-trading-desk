@@ -102,6 +102,32 @@ export function mergeWallet(state: LiveState, upd: { walletId: string; openOrder
   };
 }
 
+/** 刷新「身份列表」时把已经读到的钱包数据带过来。
+ *  fetchLiveState 只重建身份（cohort 标签、账户归属），本身不带任何 per-wallet 读数；
+ *  旧代码直接 setLive 整份替换，于是改 maker/taker、余额自动换角色、解锁/切标签页之后，
+ *  之前扫到的余额会整体消失（要等后台轮询重新扫到才回来，撞上 429 就一直显示「—」）。
+ *  这里在同一条链上按 walletId 把旧读数搬过去；换链不搬（测试网和主网的余额不是一回事）。 */
+export function mergeLiveReads(next: LiveState, prev: LiveState): LiveState {
+  if (!next.enabled || !next.wallets || !prev.wallets) return next;
+  if (next.chainId !== prev.chainId) return next;
+  const old = new Map(prev.wallets.map((w) => [w.walletId, w]));
+  return {
+    ...next,
+    wallets: next.wallets.map((w) => {
+      const p = old.get(w.walletId);
+      // 新导入的钱包没有历史读数；子账户换了（重新注册过）时旧读数也不再适用
+      if (!p || p.subaccount !== w.subaccount) return w;
+      return {
+        ...w,
+        openOrders: w.openOrders ?? p.openOrders,
+        balances: w.balances ?? p.balances,
+        positions: w.positions ?? p.positions,
+        native: w.native ?? p.native,
+      };
+    }),
+  };
+}
+
 /** One briefing card per INDEPENDENT live EOA, from the in-tab cohort. */
 export function liveWalletVMs(state: LiveState): WalletVM[] {
   if (!state.enabled || !state.wallets) return [];

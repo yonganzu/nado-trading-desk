@@ -25,6 +25,10 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+/** 不在面板展示、也不允许交易的外汇货币对（按 base 币种判断，覆盖 -PERP 后缀的写法）。
+ *  目前只剔除：英镑兑美元（GBPUSD）、日元兑美元（USDJPY）、欧元兑美元（EURUSD）。 */
+const HIDDEN_FX_BASES = new Set(["GBPUSD", "USDJPY", "EURUSD"]);
+
 // Keeps the project's FORMER name (Nado-ika) on purpose: the encrypted testnet workspace already lives
 // at ~/.nado-ika-testnet (outside the repo; the adapter scripts read the same path). Do not rename it
 // without moving that directory in the same change.
@@ -95,6 +99,8 @@ async function buildPublicConfig(chainId: number): Promise<PublicConfig> {
     const kind: "perp" | "spot" = Number(s.type) === 1 ? "perp" : "spot";
     const marketId = `nado:${kind}:${s.symbol}` as MarketId;
     const base = s.symbol.split(/[-/]/)[0] ?? s.symbol;
+    // 外汇里只剔除这三种：英镑兑美元、日元兑美元、欧元兑美元（引擎仍会返回，面板不展示也不让交易）
+    if (HIDDEN_FX_BASES.has(base.toUpperCase())) continue;
     // Correct unit interpretation: base min = one size increment; the `minSize` field is a
     // USDT0 NOTIONAL floor (not a base size). See adapter-nado/sizing.ts.
     const sizing = nadoMarketSizing(humanStr(s.priceIncrement), x18(s.sizeIncrement), x18(s.minSize));

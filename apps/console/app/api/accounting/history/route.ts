@@ -2,7 +2,9 @@
 // 通过 Nado 官方 indexer 查询历史订单（keyless、只读），把已成交订单折算成 Accounting 记录：
 //   • amount 正负 → 买/卖；base_filled/quote_filled → 数量与名义额
 //   • fee / realized_pnl 直接采用官方值（比本地 FIFO 更准）
-// 分页：按 submissionIndex 游标逐页向前翻，每个钱包最多 perWallet 条（默认 1000，上限 2000）。
+// 分页：按 submissionIndex 游标逐页向前翻，每个钱包最多 perWallet 条（默认 5000，上限 20000）。
+// 注意：indexer 单页最多 200 条 —— 传 500 会直接返回 500 条且 meta.hasMore=false，
+// 看起来「只有一页」，实际把更早的订单全丢了（积分因此偏低）。所以 MAX_PAGE 固定 200。
 // 说明：indexer 在独立 host 上且拒绝跨域浏览器请求，所以由服务端转发。
 import { NextResponse } from "next/server";
 import { IndexerClient, INDEXER_CLIENT_ENDPOINTS } from "@nadohq/indexer-client";
@@ -16,8 +18,8 @@ export const dynamic = "force-dynamic";
 
 const X18 = 1e18;
 const MAX_PAGE = 200;
-const DEFAULT_PER_WALLET = 1000;
-const MAX_PER_WALLET = 2000;
+const DEFAULT_PER_WALLET = 5000;
+const MAX_PER_WALLET = 20000;
 
 // 每个链环境一个 client（网络由 cookie 决定，与 /api/nado/dda 一致）
 const indexerByEnv = new Map<string, IndexerClient>();

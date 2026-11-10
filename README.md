@@ -32,9 +32,14 @@ pnpm --filter console dev
 入口：首页右上角的 **Accounting** 按钮（弹窗，右侧是账本明细）。
 
 1. 打开后账本**自动加载**，并订阅公共 WS 的 `fill` 流，**逐笔实时记账**——正常情况下你不需要手动"导入"。
-2. 想把开跑之前的成交也补进来：点 **Load history**，会按当前选中的子账户去拉 Nado 官方 indexer 的历史订单，
+2. 想把开跑之前的成交也补进来：点 **Load history**，会按当前选中的子账户去拉 Nado 官方 indexer 的历史订单
+   （**每个钱包最多 5000 条**，按 `submissionIndex` 游标逐页向前翻），
    按订单 `id` / 内容指纹**去重合并**（重复点不会算两遍）。
 3. **Reload ledger** 重新读取本地账本文件；**Export CSV / Export JSON** 导出报表；**Reset ledger** 清空重来。
+4. 面板底部的 **Net deposits（净充值）** 会按当前选中钱包拉取官方 indexer 的
+   `deposit_collateral`（充值）与 `withdraw_collateral`（提币）事件，显示
+   **净充值 = 充值 − 提币**、每个钱包的分项合计、以及逐笔明细（充值 +、提币 −）；
+   点 **刷新净充值** 可手动重拉。
 
 口径（表格里每一列都能对上）：
 
@@ -48,7 +53,10 @@ pnpm --filter console dev
 说明：
 - maker / taker 按成交回执标记；历史订单没有该字段时按手续费率反推（maker ≈ 1bp、taker ≈ 3.5bp），
   仍判不出来的会在表里显示 `(+n?)`。
-- 想从统计里剔除某个地址，改 `apps/console/app/lib/accountingExclusions.ts` 里的排除列表。
+- 某个钱包的成交要不要算进统计，用**钱包卡片右上角的眼睛按钮**切换：点成斜杠（`EyeSlash`）后，
+  该钱包的成交就不再计入 Accounting 的 KPI、By wallet 表、积分成本折线图和导出（原始账本不受影响，
+  随时可以再点回来）。选择按地址存在浏览器 localStorage，刷新后仍然有效。
+- 面板里已不再显示 By cohort 汇总（挂单/吃单两组的量本来就对称）。
 
 ---
 
@@ -125,20 +133,19 @@ pnpm --filter console dev
 理论成本只来自手续费：`2×maker(1bp) + 2×taker(3.5bp) = 9bp × 单笔名义额`，
 50/50 的成交量配比下 **积分成本 ≈ 0.97 USDT0 / 分**。
 
-### 5.3 开跑前会做的事
+### 5.3 开跑前与每轮开始前会做的事
 
-1. **清仓**：把所有参与钱包的残留仓位先市价平掉（跑起来之前别急着 Pause）；
-2. **余额检查**：读两侧保证金，若「弱侧 / 强侧 < 85%」或「差 ≥ 3 USDT0」，把强侧最富的与弱侧最穷的
-   **互换角色**（会写回标签、实时刷新面板）。**只在开跑前查一次**，跑起来后不再改角色。
-   手动配对（手动锁定 maker/taker）时不做互换。
+1. **清仓**：开跑前把所有参与钱包的残留仓位先市价平掉（跑起来之前别急着 Pause）；
+2. **角色平衡（默认关闭）**：曾实现「每一对里吃单方余额必须高于挂单方，否则互换」，
+   但自成交每轮里同一个钱包各当一次 maker（开仓挂单）和一次 taker（平仓去吃），
+   手续费同样是 1bp + 3.5bp，两侧费用与盈亏完全对称，**不需要按余额调换角色**。
+   代码保留在 [roleBalance.ts](apps/console/app/lib/roleBalance.ts)，把 `ROLE_BALANCE_ENABLED` 改回 `true` 即可恢复。
 
 ### 5.4 日志怎么看
 
 ```
 20:01:02.113 ▶ round 3 — makers buy                          ← 第 3 轮开始，方向
 20:01:14.880 ▶ round 2 完成｜本轮盈亏 -0.0037 USDT0（不含手续费）  ← 上一轮结算（成交回执有延迟，放到下一轮开头结算）
-20:01:00.001 ⚖ 余额：maker $40.12 / taker $39.91（弱侧 99%）   ← 开跑前的余额检查
-20:01:00.002 ⇄ 余额失衡，互换角色：0x… → taker ↔ 0x… → maker   ← 真的换了角色
 20:33:00.371 ■ no pairs traded in 3 rounds — stopping.        ← 停止原因
 ```
 
@@ -148,7 +155,10 @@ pnpm --filter console dev
 ### 5.5 什么时候会自动停
 
 - **连续 3 轮没有任何一对成交**（`■ no pairs traded in 3 rounds`）；
-- **点差连续多轮不足 3 tick**（`■ 点差连续 N 轮不足 …`）——盘口太窄时挂在内沿会被抢，引擎选择不打；
+- **点差连续 5 轮不足 3 tick**：不会立刻停，先**自动换到点差更宽的其他标的**
+  （日志 `⇄ 点差连续 5 轮不足 3 tick — 自动切换标的 A → B（当前点差 N tick）`，面板的 Market 选择框会同步更新）。
+  挑的是支持 ≥20x 杠杆、当前点差 ≥3 tick 里最宽的那个；找不到合格标的就继续用原标的，再等 5 轮重试。
+- **点差连续 60 轮不足**且一直换不到宽盘口（`■ 点差连续 60 轮不足 3 tick — stopping.`）——盘口太窄时挂在内沿会被抢，引擎选择不打；
 - 你点 Pause（会先做收尾平仓）。
 
 ### 5.6 卡住了怎么处理
@@ -169,7 +179,7 @@ apps/console/app/
   components/TradingStrategy.tsx   自成交平仓面板
   components/AccountingView.tsx    账本弹窗
   lib/automation.ts           自成交引擎（开平仓、点差、限速、停止条件）
-  lib/roleBalance.ts          开跑前的余额检查与角色互换
+  lib/roleBalance.ts          逐轮的余额合计检查与整组角色互换
   lib/inventoryWatch.ts       净仓 / 敞口统计
   lib/liveContext.ts          下单、平仓、读余额/持仓的底层封装
 packages/adapter-nado/        Nado 适配层（端点、限速、下单签名）

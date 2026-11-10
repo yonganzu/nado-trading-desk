@@ -17,7 +17,8 @@ import { activeNetwork } from "./chainEnv";
 import { shuffle } from "./rand";
 import { MIN_SPREAD_TICKS } from "./tradingRules";
 import { ensureClockOffset } from "./nadoClock";
-import { rebalanceRoles } from "./roleBalance";
+import { balancePairRoles, ROLE_BALANCE_ENABLED } from "./roleBalance";
+import { pickFatterMarket } from "./marketSwitch";
 import { getLiveConfig, productFor } from "./liveConfig";
 import { startBboCache, stopBboCache, getBboQuote } from "./bboCache";
 import { notePairInventory, inventorySummary, resetInventoryWatch,
@@ -81,6 +82,13 @@ export interface RoundHooks {
   onPairEnd?: (pair: readonly [WalletVM, WalletVM], outcome: "traded" | "skipped" | "error", ms: number) => void;
   /** 余额失衡自动换了 maker/taker 角色后触发：页面的钱包列表据此重新拉取，标签立刻更新（不必等整轮跑完）。 */
   onRolesChanged?: () => void;
+  /** 页面缓存的余额查询（walletId → USDT0 数值）；没有读数返回 null。
+   *  逐对角色平衡优先用它，省掉每个钱包一次 per-IP 读。 */
+  balanceOf?: (walletId: string) => number | null;
+  /** 角色被逐对调换后，从页面重新取一次 maker / taker 分组，下一轮按新角色配对。 */
+  reloadRoles?: () => { makers: WalletVM[]; takers: WalletVM[] } | null;
+  /** 点差不足连续多轮后自动换了标的：页面据此同步 Market 选择框，避免面板显示的还是旧标的。 */
+  onMarketChanged?: (market: string) => void;
 }
 
 export interface RoundResult {
@@ -90,6 +98,8 @@ export interface RoundResult {
   /** Pairs skipped because the spread was too tight / the book one-sided for a clean self-cross. */
   skipped: number;
   errors: number;
+  /** 本轮因为余额偏低而互换了 maker/taker 角色的对数（调用方据此重新分组）。 */
+  roleSwaps: number;
 }
 
 const short = (w: WalletVM) => w.address.value.slice(0, 6);
@@ -122,6 +132,10 @@ const NO_TRADE_LIMIT = 3;
 /** 点差不足属于「市场暂时打不了自成交」，不是引擎卡住：给它更长的等待窗口，
  *  否则盘口一收窄就 3 轮退场（实测 META bid 626.98 / ask 627.00 就是这样停的）。 */
 const THIN_SPREAD_LIMIT = 60;
+
+/** 连续多少轮点差不足就尝试换标的：5 轮足够排除一次短暂的抖动，又不会在窄盘口上白等太久。
+ *  换到更宽的标的后计数归零；找不到合格标的则再等 5 轮重试。 */
+const THIN_SPREAD_SWITCH_AFTER = 5;
 
 /** Extra attempts for a pair whose placement throws (a transient relay blip) before it's skipped. */
 const PAIR_RETRIES = 2;
@@ -551,7 +565,7 @@ async function runPair([maker, taker]: [WalletVM, WalletVM], i: number, cfg: Rou
 export async function runRound(makers: readonly WalletVM[], takers: readonly WalletVM[], cfg: RoundConfig, hooks: RoundHooks, caps: Caps = { wallet: Infinity, cohort: Infinity }, state: CapState = freshCapState()): Promise<RoundResult> {
   if (!activeNetwork().isTestnet && !cfg.mainnetConfirmed) {
     hooks.log(MAINNET_UNCONFIRMED_MSG);
-    return { pairs: 0, traded: 0, skipped: 0, errors: 0 };
+    return { pairs: 0, traded: 0, skipped: 0, errors: 0, roleSwaps: 0 };
   }
   // 手动配对优先：用户指定的一对一关系按原顺序跑；没指定时才用「两侧洗牌后 1:1」的原有逻辑
   const pairs = cfg.manualPairs && cfg.manualPairs.length > 0
@@ -559,7 +573,14 @@ export async function runRound(makers: readonly WalletVM[], takers: readonly Wal
     : buildPairs(makers, takers);
   if (pairs.length === 0) {
     hooks.log("No pairs — need at least one maker and one taker.");
-    return { pairs: 0, traded: 0, skipped: 0, errors: 0 };
+    return { pairs: 0, traded: 0, skipped: 0, errors: 0, roleSwaps: 0 };
+  }
+  // 逐对角色平衡：每对里 taker 的保证金必须高于 maker（taker 手续费更高、消耗更快）。
+  // 手动配对 = 用户把角色定死了，不覆盖；总开关关闭时整段跳过（零额外读）。
+  let roleSwaps = 0;
+  if (ROLE_BALANCE_ENABLED && !(cfg.manualPairs && cfg.manualPairs.length > 0)) {
+    const balanced = await balancePairRoles(pairs, hooks.balanceOf, hooks.log);
+    roleSwaps = balanced.swapped;
   }
   let traded = 0;
   let skipped = 0;
@@ -598,7 +619,7 @@ export async function runRound(makers: readonly WalletVM[], takers: readonly Wal
   hooks.log(`round complete: ${traded}/${pairs.length} traded${skipped ? `, ${skipped} skipped` : ""}${errors ? `, ${errors} error(s)` : ""}`);
   // 库存观察：每轮末尾输出累计口径（虚拟净仓 / 峰值 / 阈值策略下能省多少），只打日志不干预交易。
   for (const line of inventorySummary()) hooks.log(line);
-  return { pairs: pairs.length, traded, skipped, errors };
+  return { pairs: pairs.length, traded, skipped, errors, roleSwaps };
 }
 
 /** 这批钱包的累计已实现盈亏（**不含手续费**）：直接读成交账本里逐笔的 realizedPnl
@@ -649,9 +670,9 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
   );
   // Eligibility: only wallets with collateral trade (orders are gasless, so gas isn't required). Snapshot
   // at run start — log each ineligible wallet once, then run the eligible subset.
-  // 这两个数组会被「余额失衡自动换角色」就地改元素（见 roleBalance.ts），所以用 const 存引用即可
-  const eMakers = await eligible(makers, "maker", hooks);
-  const eTakers = await eligible(takers, "taker", hooks);
+  // 这两个数组会被「逐对余额平衡 / 重新分组」整体替换，所以用 let
+  let eMakers = await eligible(makers, "maker", hooks);
+  let eTakers = await eligible(takers, "taker", hooks);
   // 手动配对的名单也要过一遍「可交易」检查：任一腿不可用就跳过这一对，别拖累其它配对
   const pinned = base.manualPairs?.filter(([m, t]) => eMakers.includes(m) && eTakers.includes(t)) ?? [];
   // 手动配对 = 用户把 maker/taker 角色定死了，余额自动平衡不去覆盖它
@@ -669,6 +690,11 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
   let round = 0;
   let noTrade = 0;
   let thinSpread = 0; // 连续「点差不足」的轮次（不计入 noTrade）
+  // 当前标的：点差连续不足 THIN_SPREAD_SWITCH_AFTER 轮时会被换掉，所以不能直接用 base.market
+  let activeMarket = base.market;
+  // 本次运行里已经因为点差不足放弃过的标的：避免在两个窄盘口之间来回跳；
+  // 一旦有轮次真正成交（说明市场恢复了），就清空重新允许。
+  const avoidedMarkets = new Set<string>();
   // 本轮盈亏的采样基准。成交回执（WS）有一小段延迟，所以「上一轮的结算」放到下一轮开头再做：
   // 既不用在轮次之间插等待，也不会把还没落账的成交算漏。
   const runWalletIds = new Set([...eMakers, ...eTakers].map((w) => w.id));
@@ -680,13 +706,7 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
   // 开跑之前先把这批钱包的残留仓位清掉（上一次运行被 Pause / 429 打断时可能留下敞口）。
   // closeAllPositionsLive 读一次持仓，再对每个非零仓位发 reduce-only 穿价 IOC，等同市价全平。
   await flattenAll([...eMakers, ...eTakers], hooks, "start");
-  // 余额检查只放在「开跑前」这一瞬间：此刻仓位已经被上面的 flattenAll 清零，
-  // 换角色不会出现「一半仓位在老角色、一半在新角色」的错位；跑起来之后不再中途改动。
-  if (!pinned.length) {
-    const swapped = await rebalanceRoles(eMakers, eTakers, hooks.log);
-    // 换了角色就立刻通知页面刷新钱包：否则面板上的 maker/taker 标签要等整轮跑完才变
-    if (swapped) hooks.onRolesChanged?.();
-  }
+  // 角色平衡改为「每轮开始前」在 runRound 里逐对执行（见 roleBalance.ts），这里不再单独查一次。
   while (!hooks.signal?.aborted) {
     round++;
     // 结算上一轮（此时它的成交已经全部落账）
@@ -695,7 +715,14 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
     const makerBuys = Math.random() < 0.5;
     hooks.log(`▶ round ${round} — makers ${makerBuys ? "buy" : "sell"}`);
     pnlMark = { round, base: realizedPnlOf(runWalletIds) };
-    const r = await runRound(eMakers, eTakers, { ...base, makerBuys, manualPairs: pinned }, hooks, caps, state);
+    const r = await runRound(eMakers, eTakers, { ...base, market: activeMarket, makerBuys, manualPairs: pinned }, hooks, caps, state);
+    // 本轮有对互换了角色：cohort 标签已经写回，重新从页面取一次分组，下一轮按新角色配对；
+    // 同时通知页面刷新钱包，maker / taker 标签立刻更新（不必等整轮跑完）。
+    if (r.roleSwaps > 0) {
+      const reloaded = hooks.reloadRoles?.();
+      if (reloaded) { eMakers = reloaded.makers; eTakers = reloaded.takers; }
+      hooks.onRolesChanged?.();
+    }
     // Stop when the run can't make progress: an empty cohort, a cohort that hit its cumulative cap, or a
     // run of consecutive rounds that trade nothing (a tight market or every wallet capped) — a single
     // transient dead round is tolerated. A normal round keeps looping (the setTimeout(0) yields between).
@@ -709,6 +736,23 @@ export async function runContinuous(makers: readonly WalletVM[], takers: readonl
     noTrade = r.traded > 0 ? 0 : thinRound ? noTrade : noTrade + 1;
     if (noTrade >= NO_TRADE_LIMIT) { hooks.log(`■ no pairs traded in ${NO_TRADE_LIMIT} rounds — stopping.`); break; }
     thinSpread = thinRound ? thinSpread + 1 : 0;
+    // 有成交 = 盘口恢复了，把「放弃过的标的」清空，允许以后重新换回去
+    if (r.traded > 0) avoidedMarkets.clear();
+    // 连续 5 轮点差不足：换一个点差更宽的标的继续，而不是继续在窄盘口上白等。
+    // 每满 5 轮才尝试一次（5/10/15…），避免每轮重复查找；换成功才把计数归零，
+    // 找不到合格标的就继续累计 —— 真的一直没有宽盘口时仍由下面的 THIN_SPREAD_LIMIT 收尾。
+    if (thinSpread >= THIN_SPREAD_SWITCH_AFTER && thinSpread % THIN_SPREAD_SWITCH_AFTER === 0) {
+      const pick = await pickFatterMarket(activeMarket, avoidedMarkets);
+      if (pick) {
+        avoidedMarkets.add(activeMarket);
+        hooks.log(`⇄ 点差连续 ${thinSpread} 轮不足 ${MIN_SPREAD_TICKS} tick — 自动切换标的 ${symbolOfMarket(activeMarket)} → ${symbolOfMarket(pick.market)}（当前点差 ${pick.ticks} tick）`);
+        activeMarket = pick.market;
+        hooks.onMarketChanged?.(activeMarket);
+        thinSpread = 0;
+      } else {
+        hooks.log(`⚠ 点差连续 ${thinSpread} 轮不足 ${MIN_SPREAD_TICKS} tick，但暂时没有其它点差够宽的标的 — 继续用 ${symbolOfMarket(activeMarket)}`);
+      }
+    }
     if (thinSpread >= THIN_SPREAD_LIMIT) { hooks.log(`■ 点差连续 ${THIN_SPREAD_LIMIT} 轮不足 ${MIN_SPREAD_TICKS} tick — stopping.`); break; }
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
